@@ -669,25 +669,37 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return toResult(retry, true, true);
     }
 
-    // --- Model fallback on quota exhaustion ---
-    if (
-      fallbackModels.length > 0 &&
-      !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0
-    ) {
-      const quotaMeta = detectGeminiQuotaExhausted({
-        parsed: initial.parsed.resultEvent,
-        stdout: initial.proc.stdout,
-        stderr: initial.proc.stderr,
-      });
+    // --- Model fallback on timeout or quota exhaustion ---
+    if (fallbackModels.length > 0) {
+      const shouldFallback = (() => {
+        if (initial.proc.timedOut) return true;
+        if ((initial.proc.exitCode ?? 0) === 0) return false;
+        return detectGeminiQuotaExhausted({
+          parsed: initial.parsed.resultEvent,
+          stdout: initial.proc.stdout,
+          stderr: initial.proc.stderr,
+        }).exhausted;
+      })();
 
-      if (quotaMeta.exhausted) {
+      if (shouldFallback) {
+        const reason = initial.proc.timedOut
+          ? `timed out after ${timeoutSec}s`
+          : "quota exhausted";
         for (const fallbackModel of fallbackModels) {
           await onLog(
             "stdout",
-            `[paperclip] Model "${model}" quota exhausted; falling back to "${fallbackModel}"\n`,
+            `[paperclip] Model "${model}" ${reason}; falling back to "${fallbackModel}"\n`,
           );
           const fallbackAttempt = await runAttempt(null, fallbackModel);
+
+          if (fallbackAttempt.proc.timedOut) {
+            await onLog(
+              "stdout",
+              `[paperclip] Fallback model "${fallbackModel}" also timed out after ${timeoutSec}s; trying next...\n`,
+            );
+            continue;
+          }
+
           const fbQuota = detectGeminiQuotaExhausted({
             parsed: fallbackAttempt.parsed.resultEvent,
             stdout: fallbackAttempt.proc.stdout,
@@ -703,7 +715,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
         await onLog(
           "stdout",
-          `[paperclip] All fallback models exhausted. Returning initial failure.\n`,
+          `[paperclip] All fallback models failed. Returning initial failure.\n`,
         );
       }
     }

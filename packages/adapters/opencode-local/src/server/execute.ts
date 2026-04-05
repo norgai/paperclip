@@ -682,26 +682,39 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return toResult(retry, true);
       }
 
-      // --- Model fallback on quota exhaustion ---
-      if (
-        fallbackModels.length > 0 &&
-        initialFailed
-      ) {
-        const quotaMeta = detectOpenCodeQuotaExhausted({
-          parsed: initial.parsed,
-          stdout: initial.proc.stdout,
-          stderr: initial.proc.stderr,
-        });
+      // --- Model fallback on timeout or quota exhaustion ---
+      if (fallbackModels.length > 0) {
+        const shouldFallback = (() => {
+          if (initial.proc.timedOut) return true;
+          if (!initialFailed) return false;
+          return detectOpenCodeQuotaExhausted({
+            parsed: initial.parsed,
+            stdout: initial.proc.stdout,
+            stderr: initial.proc.stderr,
+          }).exhausted;
+        })();
 
-        if (quotaMeta.exhausted) {
+        if (shouldFallback) {
+          const reason = initial.proc.timedOut
+            ? `timed out after ${timeoutSec}s`
+            : "quota exhausted";
           for (const fallbackModel of fallbackModels) {
             await onLog(
               "stdout",
-              `[paperclip] Model "${model}" quota exhausted; falling back to "${fallbackModel}"\n`,
+              `[paperclip] Model "${model}" ${reason}; falling back to "${fallbackModel}"\n`,
             );
             const fallbackAttempt = await runAttempt(null, fallbackModel);
+
+            if (fallbackAttempt.proc.timedOut) {
+              await onLog(
+                "stdout",
+                `[paperclip] Fallback model "${fallbackModel}" also timed out after ${timeoutSec}s; trying next...\n`,
+              );
+              continue;
+            }
+
             const fallbackFailed =
-              !fallbackAttempt.proc.timedOut && ((fallbackAttempt.proc.exitCode ?? 0) !== 0 || Boolean(fallbackAttempt.parsed.errorMessage));
+              (fallbackAttempt.proc.exitCode ?? 0) !== 0 || Boolean(fallbackAttempt.parsed.errorMessage);
 
             if (fallbackFailed) {
               const fbQuota = detectOpenCodeQuotaExhausted({
@@ -716,13 +729,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
                 "stdout",
                 `[paperclip] Fallback model "${fallbackModel}" also exhausted; trying next...\n`,
               );
-            } else {
-              return toResult(fallbackAttempt, true, fallbackModel);
+              continue;
             }
+
+            return toResult(fallbackAttempt, true, fallbackModel);
           }
           await onLog(
             "stdout",
-            `[paperclip] All fallback models exhausted. Returning initial failure.\n`,
+            `[paperclip] All fallback models failed. Returning initial failure.\n`,
           );
         }
       }
