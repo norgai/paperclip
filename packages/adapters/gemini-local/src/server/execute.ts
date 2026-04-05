@@ -623,6 +623,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(attempt.parsed.resultEvent ?? {
         stdout: attempt.proc.stdout,
         stderr: attempt.proc.stderr,
+        ...(attempt.parsed.summary ? { summary: attempt.parsed.summary } : {}),
       }),
       ...(failed && clearSessionForTurnLimit ? { stopReason: "max_turns_exhausted" } : {}),
     };

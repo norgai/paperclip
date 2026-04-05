@@ -8072,7 +8072,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           try {
             const existingRunComment = await findRunIssueComment(livenessRun.id, livenessRun.companyId, issueId);
             if (!existingRunComment) {
-              const issueComment = buildHeartbeatRunIssueComment(persistedResultJson);
+              const issueComment =
+                (typeof adapterResult.summary === "string" && adapterResult.summary.trim().length > 0
+                  ? adapterResult.summary.trim()
+                  : null)
+                ?? buildHeartbeatRunIssueComment(persistedResultJson);
               if (issueComment) {
                 await issuesSvc.addComment(issueId, issueComment, { agentId: agent.id, runId: livenessRun.id });
               }
