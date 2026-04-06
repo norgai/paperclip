@@ -420,3 +420,10 @@ export type {
   PluginDatabaseNamespaceMode,
   PluginDatabaseNamespaceStatus,
 } from "./plugin.js";
+export type {
+  GatewayCircuitBreakerState,
+  GatewayRoute,
+  GatewayRouteHealth,
+  GatewayRouteWithHealth,
+  GatewayRouteStat,
+} from "./gateway.js";

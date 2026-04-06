@@ -15,6 +15,7 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  gatewayRoutes,
 } from "@paperclipai/db";
 import { AGENT_DEFAULT_MAX_CONCURRENT_RUNS, isUuidLike, normalizeAgentUrlKey } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
@@ -522,6 +523,7 @@ export function agentService(db: Db) {
         await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
+        await tx.delete(gatewayRoutes).where(eq(gatewayRoutes.agentId, id));
         const deleted = await tx
           .delete(agents)
           .where(eq(agents.id, id))
