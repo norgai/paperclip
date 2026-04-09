@@ -1175,32 +1175,39 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
               {(adapterType === "gemini_local" || adapterType === "opencode_local") && !isCreate && (
                 <div className="space-y-3">
-                  {gatewayActive && (
-                    <div className="border border-amber-400/30 dark:border-amber-500/25 bg-amber-50 dark:bg-amber-500/5 rounded-md px-3 py-2 space-y-1.5">
+                  {gatewayActive ? (
+                    <div className="border border-blue-400/30 dark:border-blue-500/25 bg-blue-50 dark:bg-blue-500/5 rounded-md px-3 py-2 space-y-1.5">
                       <div className="flex items-center gap-2 text-xs">
-                        <ShieldAlert className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />
-                        <span className="text-amber-800 dark:text-amber-200 font-medium">Cross-adapter note</span>
+                        <Zap className="h-3.5 w-3.5 text-blue-600 dark:text-blue-400 shrink-0" />
+                        <span className="text-blue-800 dark:text-blue-200 font-medium">Fallback models managed by Gateway</span>
                       </div>
-                      <p className="text-[11px] text-amber-700 dark:text-amber-100/70 leading-relaxed">
-                        Gateway routes may use different adapters (e.g. Gemini, Codex). When a cross-adapter route is active, the fallback models below are automatically skipped because they are only compatible with <span className="font-mono text-amber-900 dark:text-amber-200">{adapterType.replace(/_local$/, "")}</span>. They only apply when all gateway routes are exhausted and this default adapter takes over.
+                      <p className="text-[11px] text-blue-700 dark:text-blue-100/70 leading-relaxed">
+                        When Gateway Routing is active, fallback models are configured per-route for finer control. Each route can define its own fallback chain specific to its adapter type.
                       </p>
+                      <Link
+                        to={`/agents/${agentId}/gateway`}
+                        className="inline-block text-[11px] text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 underline decoration-blue-300/30 dark:decoration-blue-400/30 hover:decoration-blue-500/50"
+                      >
+                        Configure fallback models in Gateway →
+                      </Link>
                     </div>
+                  ) : (
+                    <Field label="Fallback models" hint="Ordered list of fallback model IDs to try when the primary model hits quota/rate limits. Comma-separated.">
+                      <DraftInput
+                        value={eff("adapterConfig", "fallbackModels", formatArgList(config.fallbackModels))}
+                        onCommit={(v) =>
+                          mark("adapterConfig", "fallbackModels", v ? parseCommaArgs(v) : undefined)
+                        }
+                        immediate
+                        className={inputClass}
+                        placeholder={
+                          adapterType === "gemini_local"
+                            ? "e.g. gemini-2.5-flash, gemini-2.5-flash-lite"
+                            : "e.g. opencode/qwen3.6-plus-free, alibaba-cn/qwen-plus"
+                        }
+                      />
+                    </Field>
                   )}
-                  <Field label={gatewayActive ? `Fallback models (${adapterType.replace(/_local$/, "")} only)` : "Fallback models"} hint="Ordered list of fallback model IDs to try when the primary model hits quota/rate limits. Comma-separated.">
-                    <DraftInput
-                      value={eff("adapterConfig", "fallbackModels", formatArgList(config.fallbackModels))}
-                      onCommit={(v) =>
-                        mark("adapterConfig", "fallbackModels", v ? parseCommaArgs(v) : undefined)
-                      }
-                      immediate
-                      className={inputClass}
-                      placeholder={
-                        adapterType === "gemini_local"
-                          ? "e.g. gemini-2.5-flash, gemini-2.5-flash-lite"
-                          : "e.g. opencode/qwen3.6-plus-free, alibaba-cn/qwen-plus"
-                      }
-                    />
-                  </Field>
                 </div>
               )}
 
