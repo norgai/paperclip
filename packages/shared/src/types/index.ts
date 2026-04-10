@@ -226,3 +226,10 @@ export type {
   PluginJobRunRecord,
   PluginWebhookDeliveryRecord,
 } from "./plugin.js";
+export type {
+  GatewayCircuitBreakerState,
+  GatewayRoute,
+  GatewayRouteHealth,
+  GatewayRouteWithHealth,
+  GatewayRouteStat,
+} from "./gateway.js";

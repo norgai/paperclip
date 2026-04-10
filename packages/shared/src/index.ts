@@ -359,6 +359,11 @@ export type {
   PluginWebhookDeliveryRecord,
   QuotaWindow,
   ProviderQuotaResult,
+  GatewayCircuitBreakerState,
+  GatewayRoute,
+  GatewayRouteHealth,
+  GatewayRouteWithHealth,
+  GatewayRouteStat,
 } from "./types/index.js";
 
 export {
