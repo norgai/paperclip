@@ -2192,6 +2192,7 @@ export function heartbeatService(db: Db) {
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
       preflightEnabled: asBoolean(heartbeat.preflightEnabled, instancePreflightDefault),
+      triageModel: asString(heartbeat.triageModel, process.env.HEARTBEAT_TRIAGE_MODEL || ""),
     };
   }
 
@@ -2231,23 +2232,56 @@ export function heartbeatService(db: Db) {
    * Lightweight preflight check that determines whether an agent has any
    * pending work worth invoking the LLM adapter for.
    */
-  async function hasPendingWork(agent: typeof agents.$inferSelect): Promise<boolean> {
-    // 1. Active issues assigned to this agent
-    const activeIssue = await db
-      .select({ id: issues.id })
+  type WorkClassification = {
+    hasWork: boolean;
+    complexity: "none" | "routine" | "complex";
+    reason: string;
+  };
+
+  /**
+   * Classify pending work to determine whether the agent should wake up
+   * and which model tier is appropriate.
+   *
+   * - "none": no pending work, skip heartbeat entirely
+   * - "routine": only blocked/in_review tasks or simple comments — use triage model (e.g. Haiku)
+   * - "complex": todo/in_progress tasks or new assignments — use primary model
+   */
+  async function classifyPendingWork(agent: typeof agents.$inferSelect): Promise<WorkClassification> {
+    // 1. Check for actionable issues (todo, in_progress = complex work)
+    const actionableIssue = await db
+      .select({ id: issues.id, status: issues.status })
       .from(issues)
       .where(
         and(
           eq(issues.assigneeAgentId, agent.id),
           eq(issues.companyId, agent.companyId),
-          inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
+          inArray(issues.status, ["todo", "in_progress"]),
         ),
       )
       .limit(1);
 
-    if (activeIssue.length > 0) return true;
+    if (actionableIssue.length > 0) {
+      return { hasWork: true, complexity: "complex", reason: `active_issue:${actionableIssue[0].status}` };
+    }
 
-    // 2. New comments on agents issues since last heartbeat (by someone other than the agent)
+    // 2. Check for review/blocked issues (routine — status check, comment, delegate)
+    const reviewIssue = await db
+      .select({ id: issues.id, status: issues.status })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.assigneeAgentId, agent.id),
+          eq(issues.companyId, agent.companyId),
+          inArray(issues.status, ["in_review", "blocked"]),
+        ),
+      )
+      .limit(1);
+
+    if (reviewIssue.length > 0) {
+      return { hasWork: true, complexity: "routine", reason: `review_issue:${reviewIssue[0].status}` };
+    }
+
+    // 3. New comments on agent's issues since last heartbeat
     const since = new Date(agent.lastHeartbeatAt ?? agent.createdAt);
     const newComment = await db
       .select({ id: issueComments.id })
@@ -2266,9 +2300,11 @@ export function heartbeatService(db: Db) {
       )
       .limit(1);
 
-    if (newComment.length > 0) return true;
+    if (newComment.length > 0) {
+      return { hasWork: true, complexity: "routine", reason: "new_comment" };
+    }
 
-    // 3. Pending approvals requested by this agent
+    // 4. Pending approvals
     const pendingApproval = await db
       .select({ id: approvals.id })
       .from(approvals)
@@ -2281,7 +2317,11 @@ export function heartbeatService(db: Db) {
       )
       .limit(1);
 
-    return pendingApproval.length > 0;
+    if (pendingApproval.length > 0) {
+      return { hasWork: true, complexity: "routine", reason: "pending_approval" };
+    }
+
+    return { hasWork: false, complexity: "none", reason: "no_pending_work" };
   }
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
@@ -3915,6 +3955,10 @@ export function heartbeatService(db: Db) {
     // Preflight check: skip heartbeat when there is no pending work.
     // Only applies to timer and automation sources. Wakeups that already
     // carry a specific target (issueId, commentId) always bypass the check.
+
+    // Preflight check: skip heartbeat when there is no pending work.
+    // When work exists, classify complexity to select model tier.
+    // Only applies to timer and automation sources.
     if (policy.preflightEnabled && (source === "timer" || source === "automation")) {
       const hasExplicitTarget =
         readNonEmptyString(enrichedContextSnapshot.issueId) ||
@@ -3924,8 +3968,8 @@ export function heartbeatService(db: Db) {
         reason === "issue_comment_mentioned";
 
       if (!hasExplicitTarget) {
-        const pending = await hasPendingWork(agent);
-        if (!pending) {
+        const classification = await classifyPendingWork(agent);
+        if (!classification.hasWork) {
           await writeSkippedRequest("preflight.no_pending_work", {
             countsForHeartbeatInterval: source === "timer",
           });
@@ -3936,8 +3980,18 @@ export function heartbeatService(db: Db) {
           });
           return null;
         }
+
+        // Triage model: use lighter model for routine work (blocked/review/comments)
+        if (classification.complexity === "routine" && policy.triageModel) {
+          runtimeConfig = { ...runtimeConfig, model: policy.triageModel };
+          logger.info(
+            { agentId, complexity: classification.complexity, reason: classification.reason, triageModel: policy.triageModel },
+            "Heartbeat triage: using lighter model for routine work",
+          );
+        }
       }
     }
+
 
     const bypassIssueExecutionLock =
       reason === "issue_comment_mentioned" ||
