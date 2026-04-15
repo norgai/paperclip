@@ -12,6 +12,7 @@ export default defineConfig({
     },
   },
   server: {
+    allowedHosts: ["paperclip.norg.ai"],
     port: 5173,
     // WSL2 /mnt/ drives don't support inotify — fall back to polling so HMR works
     watch: process.cwd().startsWith("/mnt/") ? { usePolling: true, interval: 1000 } : undefined,

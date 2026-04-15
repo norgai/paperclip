@@ -1132,7 +1132,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  // agentParams.paperclip = paperclipPayload; // PATCHED: PR #626 fix
+  delete agentParams.paperclip; // Ensure paperclip never reaches the gateway
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {
