@@ -7348,6 +7348,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ...effectiveResolvedConfig,
       paperclipRuntimeSkills: runtimeSkillEntries,
     };
+
+    // Apply triage model override from enqueueWakeup (set by preflight/always triage)
+    const triageModelOverride = readNonEmptyString(context.triageModelOverride);
+    if (triageModelOverride) {
+      runtimeConfig = { ...runtimeConfig, model: triageModelOverride };
+    }
     const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
       companyId: agent.companyId,
       heartbeatRunId: run.id,
@@ -9020,7 +9026,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason === "issue_comment_mentioned";
 
       if (!hasExplicitTarget) {
-        runtimeConfig = { ...runtimeConfig, model: policy.triageModel };
+        enrichedContextSnapshot.triageModelOverride = policy.triageModel;
         triageLog({ event: "triage_always", agentId, agentName: agent.name, model: policy.triageModel, source });
         logger.info(
           { agentId, triageModel: policy.triageModel },
@@ -9055,7 +9061,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         // Triage model: use lighter model for routine work (blocked/review/comments)
         if (classification.complexity === "routine" && policy.triageModel) {
-          runtimeConfig = { ...runtimeConfig, model: policy.triageModel };
+          enrichedContextSnapshot.triageModelOverride = policy.triageModel;
           logger.info(
             { agentId, complexity: classification.complexity, reason: classification.reason, triageModel: policy.triageModel },
             "Heartbeat triage: using lighter model for routine work",
