@@ -1125,6 +1125,14 @@ function resolveNextSessionState(input: {
 
 export function heartbeatService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
+
+  // Independent heartbeat triage logger — writes to a separate file for easy monitoring
+  const TRIAGE_LOG_DIR = process.env.HEARTBEAT_TRIAGE_LOG_DIR || "/home/azureuser/.paperclip/instances/default/data/heartbeat-triage";
+  const triageLog = (entry: Record<string, unknown>) => {
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n";
+    fs.appendFile(`${TRIAGE_LOG_DIR}/triage.log`, line).catch(() => {});
+  };
+
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -2193,6 +2201,7 @@ export function heartbeatService(db: Db) {
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
       preflightEnabled: asBoolean(heartbeat.preflightEnabled, instancePreflightDefault),
       triageModel: asString(heartbeat.triageModel, process.env.HEARTBEAT_TRIAGE_MODEL || ""),
+      triageMode: asString(heartbeat.triageMode, process.env.HEARTBEAT_TRIAGE_MODE || "preflight") as "preflight" | "always" | "off",
     };
   }
 
@@ -3349,6 +3358,7 @@ export function heartbeatService(db: Db) {
           "local agent jwt secret missing or invalid; running without injected PAPERCLIP_API_KEY",
         );
       }
+      triageLog({ event: "adapter_execute", agentId: agent.id, agentName: agent.name, adapter: effectiveAdapterType, model: effectiveConfig.model ?? "default", runId: run.id });
       const adapterResult = await adapter.execute({
         runId: run.id,
         agent: gatewayDecision
@@ -3867,6 +3877,7 @@ export function heartbeatService(db: Db) {
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
     const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
+    triageLog({ event: "heartbeat_wake", agentId, agentName: agent.name, source, reason, issueId: readNonEmptyString(enrichedContextSnapshot.issueId) ?? null });
     if (explicitResumeSession) {
       enrichedContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
       enrichedContextSnapshot.resumeSessionDisplayId = explicitResumeSession.sessionDisplayId;
@@ -3959,7 +3970,28 @@ export function heartbeatService(db: Db) {
     // Preflight check: skip heartbeat when there is no pending work.
     // When work exists, classify complexity to select model tier.
     // Only applies to timer and automation sources.
-    if (policy.preflightEnabled && (source === "timer" || source === "automation")) {
+
+    // "always" triage mode: skip SQL preflight, use triage model for all timer/automation wakes
+    if (policy.triageMode === "always" && policy.triageModel && (source === "timer" || source === "automation")) {
+      const hasExplicitTarget =
+        readNonEmptyString(enrichedContextSnapshot.issueId) ||
+        readNonEmptyString(enrichedContextSnapshot.commentId) ||
+        readNonEmptyString(enrichedContextSnapshot.wakeCommentId) ||
+        issueId ||
+        reason === "issue_comment_mentioned";
+
+      if (!hasExplicitTarget) {
+        runtimeConfig = { ...runtimeConfig, model: policy.triageModel };
+        triageLog({ event: "triage_always", agentId, agentName: agent.name, model: policy.triageModel, source });
+        logger.info(
+          { agentId, triageModel: policy.triageModel },
+          "Heartbeat triage (always mode): using triage model for all scheduled wakes",
+        );
+      }
+    }
+
+    if (policy.preflightEnabled && policy.triageMode !== "always" && (source === "timer" || source === "automation")) {
+      triageLog({ event: "preflight_start", agentId, agentName: agent.name, source, reason });
       const hasExplicitTarget =
         readNonEmptyString(enrichedContextSnapshot.issueId) ||
         readNonEmptyString(enrichedContextSnapshot.commentId) ||
@@ -3978,6 +4010,7 @@ export function heartbeatService(db: Db) {
             type: "heartbeat.preflight.skipped",
             payload: { agentId, source, reason: "no_pending_work" },
           });
+          triageLog({ event: "preflight_skip", agentId, agentName: agent.name, reason: "no_pending_work" });
           return null;
         }
 
@@ -3988,6 +4021,7 @@ export function heartbeatService(db: Db) {
             { agentId, complexity: classification.complexity, reason: classification.reason, triageModel: policy.triageModel },
             "Heartbeat triage: using lighter model for routine work",
           );
+          triageLog({ event: "triage_downgrade", agentId, agentName: agent.name, complexity: classification.complexity, reason: classification.reason, model: policy.triageModel });
         }
       }
     }
