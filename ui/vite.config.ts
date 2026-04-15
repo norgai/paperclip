@@ -23,6 +23,7 @@ export default defineConfig(({ mode }) => ({
     },
   },
   server: {
+    allowedHosts: ["paperclip.norg.ai"],
     port: 5173,
     watch: createUiDevWatchOptions(process.cwd()),
     proxy: {

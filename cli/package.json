@@ -26,14 +26,8 @@
   "files": [
     "dist"
   ],
-  "publishConfig": {
-    "access": "public"
-  },
-  "scripts": {
-    "dev": "tsx src/index.ts",
-    "build": "node --input-type=module -e \"import esbuild from 'esbuild'; import config from './esbuild.config.mjs'; await esbuild.build(config);\" && chmod +x dist/index.js",
-    "clean": "rm -rf dist",
-    "typecheck": "tsc --noEmit"
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@clack/prompts": "^0.10.0",
@@ -54,12 +48,12 @@
     "drizzle-orm": "0.45.2",
     "dotenv": "^17.0.1",
     "commander": "^13.1.0",
+    "dotenv": "^17.0.1",
+    "drizzle-orm": "0.38.4",
     "embedded-postgres": "^18.1.0-beta.16",
-    "picocolors": "^1.1.1"
-  },
-  "devDependencies": {
-    "@types/node": "^22.12.0",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.3"
+    "picocolors": "^1.1.1",
+    "postgres": "^3.4.5",
+    "ws": "^8.19.0",
+    "zod": "^3.24.2"
   }
 }
