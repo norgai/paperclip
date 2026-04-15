@@ -1472,6 +1472,43 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                   </div>
                 ) : null}
               </div>
+              <ToggleField
+                label="Heartbeat preflight (skip idle)"
+                hint={help.preflightEnabled}
+                checked={eff(
+                  "heartbeat",
+                  "preflightEnabled",
+                  heartbeat.preflightEnabled === true,
+                )}
+                onChange={(v) => mark("heartbeat", "preflightEnabled", v)}
+              />
+              <Field label="Triage mode" hint={help.triageMode}>
+                <select
+                  value={eff(
+                    "heartbeat",
+                    "triageMode",
+                    String(heartbeat.triageMode ?? "off"),
+                  )}
+                  onChange={(e) => mark("heartbeat", "triageMode", e.target.value)}
+                  className={inputClass}
+                >
+                  <option value="off">Off</option>
+                  <option value="preflight">Preflight (classify work, downgrade routine)</option>
+                  <option value="always">Always (use triage model for all scheduled)</option>
+                </select>
+              </Field>
+              <Field label="Triage model" hint={help.triageModel}>
+                <DraftInput
+                  value={eff(
+                    "heartbeat",
+                    "triageModel",
+                    String(heartbeat.triageModel ?? ""),
+                  )}
+                  onCommit={(v) => mark("heartbeat", "triageModel", v)}
+                  placeholder="e.g. claude-haiku-4-5"
+                  className={inputClass}
+                />
+              </Field>
             </div>
           </CollapsibleSection>
           </div>

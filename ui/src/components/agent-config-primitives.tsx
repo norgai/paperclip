@@ -59,6 +59,9 @@ export const help: Record<string, string> = {
   maxTurnContinuationEnabled: "Automatically queue bounded continuation runs when an adapter stops because its per-run turn cap was exhausted.",
   maxTurnContinuationMaxAttempts: "Maximum automatic continuations after one max-turn stop. This is separate from max turns per run.",
   maxTurnContinuationDelaySec: "Seconds to wait before starting each max-turn continuation.",
+  preflightEnabled: "Skip heartbeat entirely when no pending work exists (assigned issues, new comments, or approvals). Saves tokens on idle agents.",
+  triageMode: "How to select model for heartbeat runs. Preflight: use SQL check to classify work complexity, downgrade routine work to triage model. Always: always use triage model for scheduled heartbeats. Off: disabled.",
+  triageModel: "Lighter model used for routine heartbeat work (blocked tasks, status checks, comment replies). e.g. claude-haiku-4-5",
   budgetMonthlyCents: "Monthly spending limit in cents. 0 means no limit.",
 };
 
