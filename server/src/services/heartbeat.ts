@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
-import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
@@ -12,6 +12,7 @@ import {
   agentWakeupRequests,
   heartbeatRunEvents,
   heartbeatRuns,
+  approvals,
   issueComments,
   issues,
   projects,
@@ -2183,12 +2184,14 @@ export function heartbeatService(db: Db) {
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
     const heartbeat = parseObject(runtimeConfig.heartbeat);
+    const instancePreflightDefault = process.env.HEARTBEAT_PREFLIGHT_ENABLED === "true";
 
     return {
       enabled: asBoolean(heartbeat.enabled, false),
       intervalSec: Math.max(0, asNumber(heartbeat.intervalSec, 0)),
       wakeOnDemand: asBoolean(heartbeat.wakeOnDemand ?? heartbeat.wakeOnAssignment ?? heartbeat.wakeOnOnDemand ?? heartbeat.wakeOnAutomation, true),
       maxConcurrentRuns: normalizeMaxConcurrentRuns(heartbeat.maxConcurrentRuns),
+      preflightEnabled: asBoolean(heartbeat.preflightEnabled, instancePreflightDefault),
     };
   }
 
@@ -2198,6 +2201,87 @@ export function heartbeatService(db: Db) {
       .from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "running")));
     return Number(count ?? 0);
+  }
+
+
+  async function recordHeartbeatCheck(agent: typeof agents.$inferSelect, checkedAt: Date) {
+    const updated = await db
+      .update(agents)
+      .set({
+        lastHeartbeatAt: checkedAt,
+        updatedAt: checkedAt,
+      })
+      .where(
+        and(
+          eq(agents.id, agent.id),
+          eq(agents.companyId, agent.companyId),
+          or(isNull(agents.lastHeartbeatAt), lt(agents.lastHeartbeatAt, checkedAt)),
+        ),
+      )
+      .returning()
+      .then((rows) => rows[0] ?? null);
+
+    if (!updated || agent.lastHeartbeatAt) return;
+
+    const tc = getTelemetryClient();
+    if (tc) trackAgentFirstHeartbeat(tc, { agentRole: updated.role });
+  }
+
+  /**
+   * Lightweight preflight check that determines whether an agent has any
+   * pending work worth invoking the LLM adapter for.
+   */
+  async function hasPendingWork(agent: typeof agents.$inferSelect): Promise<boolean> {
+    // 1. Active issues assigned to this agent
+    const activeIssue = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.assigneeAgentId, agent.id),
+          eq(issues.companyId, agent.companyId),
+          inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
+        ),
+      )
+      .limit(1);
+
+    if (activeIssue.length > 0) return true;
+
+    // 2. New comments on agents issues since last heartbeat (by someone other than the agent)
+    const since = new Date(agent.lastHeartbeatAt ?? agent.createdAt);
+    const newComment = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .innerJoin(issues, eq(issueComments.issueId, issues.id))
+      .where(
+        and(
+          eq(issues.assigneeAgentId, agent.id),
+          eq(issues.companyId, agent.companyId),
+          gt(issueComments.createdAt, since),
+          or(
+            isNull(issueComments.authorAgentId),
+            ne(issueComments.authorAgentId, agent.id),
+          ),
+        ),
+      )
+      .limit(1);
+
+    if (newComment.length > 0) return true;
+
+    // 3. Pending approvals requested by this agent
+    const pendingApproval = await db
+      .select({ id: approvals.id })
+      .from(approvals)
+      .where(
+        and(
+          eq(approvals.requestedByAgentId, agent.id),
+          eq(approvals.companyId, agent.companyId),
+          eq(approvals.status, "pending"),
+        ),
+      )
+      .limit(1);
+
+    return pendingApproval.length > 0;
   }
 
   async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect) {
@@ -2339,6 +2423,7 @@ export function heartbeatService(db: Db) {
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
+  approvals,
         adapterType: agents.adapterType,
       })
       .from(heartbeatRuns)
@@ -3763,7 +3848,11 @@ export function heartbeatService(db: Db) {
       explicitResumeSession?.sessionDisplayId ??
       await resolveSessionBeforeForWakeup(agent, effectiveTaskKey);
 
-    const writeSkippedRequest = async (skipReason: string) => {
+    const writeSkippedRequest = async (
+      skipReason: string,
+      options?: { countsForHeartbeatInterval?: boolean },
+    ) => {
+      const finishedAt = new Date();
       await db.insert(agentWakeupRequests).values({
         companyId: agent.companyId,
         agentId,
@@ -3775,8 +3864,12 @@ export function heartbeatService(db: Db) {
         requestedByActorType: opts.requestedByActorType ?? null,
         requestedByActorId: opts.requestedByActorId ?? null,
         idempotencyKey: opts.idempotencyKey ?? null,
-        finishedAt: new Date(),
+        finishedAt,
       });
+
+      if (options?.countsForHeartbeatInterval) {
+        await recordHeartbeatCheck(agent, finishedAt);
+      }
     };
 
     let projectId = readNonEmptyString(enrichedContextSnapshot.projectId);
@@ -3817,6 +3910,34 @@ export function heartbeatService(db: Db) {
     if (source !== "timer" && !policy.wakeOnDemand) {
       await writeSkippedRequest("heartbeat.wakeOnDemand.disabled");
       return null;
+    }
+
+
+    // Preflight check: skip heartbeat when there is no pending work.
+    // Only applies to timer and automation sources. Wakeups that already
+    // carry a specific target (issueId, commentId) always bypass the check.
+    if (policy.preflightEnabled && (source === "timer" || source === "automation")) {
+      const hasExplicitTarget =
+        readNonEmptyString(enrichedContextSnapshot.issueId) ||
+        readNonEmptyString(enrichedContextSnapshot.commentId) ||
+        readNonEmptyString(enrichedContextSnapshot.wakeCommentId) ||
+        issueId ||
+        reason === "issue_comment_mentioned";
+
+      if (!hasExplicitTarget) {
+        const pending = await hasPendingWork(agent);
+        if (!pending) {
+          await writeSkippedRequest("preflight.no_pending_work", {
+            countsForHeartbeatInterval: source === "timer",
+          });
+          publishLiveEvent({
+            companyId: agent.companyId,
+            type: "heartbeat.preflight.skipped",
+            payload: { agentId, source, reason: "no_pending_work" },
+          });
+          return null;
+        }
+      }
     }
 
     const bypassIssueExecutionLock =
@@ -4365,10 +4486,9 @@ export function heartbeatService(db: Db) {
       });
 
       await setWakeupStatus(run.wakeupRequestId, "cancelled", {
-        finishedAt: new Date(),
+        finishedAt,
         error: reason,
       });
-
       const running = runningProcesses.get(run.id);
       if (running) {
         running.child.kill("SIGTERM");
