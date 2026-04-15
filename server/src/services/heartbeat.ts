@@ -2860,9 +2860,16 @@ export function heartbeatService(db: Db) {
     };
 
     // Apply triage model override from enqueueWakeup (set by preflight/always triage)
+    // Apply triage model override from enqueueWakeup (set by preflight/always triage)
     const triageModelOverride = readNonEmptyString(context.triageModelOverride);
+    let forceNewSession = false;
     if (triageModelOverride) {
       runtimeConfig = { ...runtimeConfig, model: triageModelOverride };
+      // Force fresh session — triage uses a smaller model that cannot resume
+      // sessions built with a larger model (prompt too long)
+      forceNewSession = true;
+      // Also cap max turns for triage runs to keep them lightweight
+      runtimeConfig = { ...runtimeConfig, maxTurnsPerRun: Math.min(runtimeConfig.maxTurnsPerRun ?? 300, 5) };
     }
     const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
       companyId: agent.companyId,
@@ -3127,9 +3134,9 @@ export function heartbeatService(db: Db) {
     }
 
     const runtimeForAdapter = {
-      sessionId: runtimeSessionIdForAdapter,
-      sessionParams: runtimeSessionParamsForAdapter,
-      sessionDisplayId: previousSessionDisplayId,
+      sessionId: forceNewSession ? null : runtimeSessionIdForAdapter,
+      sessionParams: forceNewSession ? null : runtimeSessionParamsForAdapter,
+      sessionDisplayId: forceNewSession ? null : previousSessionDisplayId,
       taskKey,
     };
 
