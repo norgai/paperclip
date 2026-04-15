@@ -6653,7 +6653,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
-  approvals,
         adapterType: agents.adapterType,
         adapterConfig: agents.adapterConfig,
       })
