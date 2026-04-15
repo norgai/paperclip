@@ -59,7 +59,7 @@ import type {
   UsageSummary,
 } from "../adapters/index.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
-import { parseObject, asBoolean, asNumber, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
+import { parseObject, asBoolean, asNumber, asString, appendWithByteCap, appendWithCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import * as gatewayService from "./gateway.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
