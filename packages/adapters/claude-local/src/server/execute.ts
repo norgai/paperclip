@@ -269,6 +269,11 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
+
+  // Inject claude-code-cache-fix preload to fix prompt cache regression (#41930, #46917)
+  const cacheFix = process.env.CLAUDE_CACHE_FIX_PRELOAD || "/home/azureuser/.npm-global/lib/node_modules/claude-code-cache-fix/preload.mjs";
+  try { require("fs").accessSync(cacheFix); env.NODE_OPTIONS = `--import ${cacheFix} ${env.NODE_OPTIONS ?? process.env.NODE_OPTIONS ?? ""}`.trim(); } catch { /* cache fix not installed, skip */ }
+
   const runtimeEnv = Object.fromEntries(
     Object.entries(ensurePathInEnv({ ...process.env, ...env })).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
