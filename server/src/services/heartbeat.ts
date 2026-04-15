@@ -2423,7 +2423,6 @@ export function heartbeatService(db: Db) {
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
-  approvals,
         adapterType: agents.adapterType,
       })
       .from(heartbeatRuns)
