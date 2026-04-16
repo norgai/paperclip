@@ -2380,6 +2380,94 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     fs.appendFile(`${TRIAGE_LOG_DIR}/triage.log`, line).catch(() => {});
   };
 
+  // Manifest triage: lightweight LLM call to decide if a full adapter run is needed.
+  // Uses Manifest LLM router (OpenAI-compatible) with a compact prompt (~500 tokens).
+  // Returns "skip" (no work), "routine" (use triage model), or "complex" (use primary model).
+  async function manifestTriage(
+    agent: { id: string; name: string; role: string | null },
+    classification: { hasWork: boolean; complexity: string; reason: string },
+    issueSnapshots: Array<{ identifier: string; status: string; priority: string; title: string }>,
+    wakeReason: string | null,
+  ): Promise<"skip" | "routine" | "complex"> {
+    const url = process.env.MANIFEST_TRIAGE_URL || "https://openrouter.ai/api/v1/chat/completions";
+    const apiKey = process.env.MANIFEST_TRIAGE_API_KEY || process.env.OPEN_ROUTER_KEY || "";
+    if (!apiKey) {
+      triageLog({ event: "manifest_triage_skip_no_key", agentId: agent.id, agentName: agent.name });
+      return classification.complexity === "complex" ? "complex" : "routine";
+    }
+
+    const issueList = issueSnapshots.length > 0
+      ? issueSnapshots.map(i => `- ${i.identifier} [${i.status}] ${i.priority}: ${i.title}`).join("\n")
+      : "- (no issues assigned)";
+
+    const prompt = `You are a triage assistant for a Paperclip agent heartbeat.
+
+Agent: "${agent.name}" (${agent.role || "general"})
+Wake reason: ${wakeReason || "timer"}
+SQL preflight: ${classification.complexity} (${classification.reason})
+Assigned issues:
+${issueList}
+
+Classify this heartbeat into exactly one category:
+- SKIP: All issues are blocked with no new comments, or only in_review with no new feedback. No action needed this heartbeat.
+- ROUTINE: Simple status checks, comment acknowledgment, blocked-task dedup. Low-effort work.
+- COMPLEX: There are todo or in_progress tasks, or new comments that require substantive action.
+
+Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 10_000);
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: process.env.MANIFEST_TRIAGE_MODEL || "liquid/lfm-2.5-1.2b-instruct:free",
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 20,
+          temperature: 0,
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        triageLog({ event: "manifest_triage_error", agentId: agent.id, agentName: agent.name, status: response.status });
+        return classification.complexity === "complex" ? "complex" : "routine";
+      }
+
+      const result = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      const answer = (result.choices?.[0]?.message?.content ?? "").trim().toUpperCase();
+
+      let decision: "skip" | "routine" | "complex";
+      if (answer.includes("SKIP")) decision = "skip";
+      else if (answer.includes("COMPLEX")) decision = "complex";
+      else decision = "routine";
+
+      triageLog({
+        event: "manifest_triage",
+        agentId: agent.id,
+        agentName: agent.name,
+        decision,
+        rawAnswer: answer,
+        sqlClassification: classification.complexity,
+        sqlReason: classification.reason,
+        issueCount: issueSnapshots.length,
+        wakeReason,
+      });
+
+      return decision;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      triageLog({ event: "manifest_triage_error", agentId: agent.id, agentName: agent.name, error: msg });
+      // Fall back to SQL classification on error
+      return classification.complexity === "complex" ? "complex" : "routine";
+    }
+  }
+
   const getCurrentUserRedactionOptions = async () => ({
     enabled: (await instanceSettings.getGeneral()).censorUsernameInLogs,
   });
@@ -5852,6 +5940,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       preflightEnabled: asBoolean(heartbeat.preflightEnabled, instancePreflightDefault),
       triageModel: asString(heartbeat.triageModel, process.env.HEARTBEAT_TRIAGE_MODEL || ""),
       triageMode: asString(heartbeat.triageMode, process.env.HEARTBEAT_TRIAGE_MODE || "preflight") as "preflight" | "always" | "off",
+      manifestTriageEnabled: asBoolean(heartbeat.manifestTriageEnabled, process.env.MANIFEST_TRIAGE_ENABLED === "true"),
     };
   }
 
@@ -9064,8 +9153,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason === "issue_comment_mentioned";
 
       if (!hasExplicitTarget) {
-        enrichedContextSnapshot.triageModelOverride = policy.triageModel;
-        triageLog({ event: "triage_always", agentId, agentName: agent.name, model: policy.triageModel, source });
+        // Manifest triage for "always" mode: check if we can skip entirely
+        if (policy.manifestTriageEnabled) {
+          const classification = await classifyPendingWork(agent);
+          if (!classification.hasWork) {
+            await writeSkippedRequest("manifest_triage.no_work", { countsForHeartbeatInterval: source === "timer" });
+            triageLog({ event: "manifest_triage_skip", agentId, agentName: agent.name, reason: "no_pending_work" });
+            return null;
+          }
+          const issueSnapshots = await db
+            .select({ identifier: issues.identifier, status: issues.status, priority: issues.priority, title: issues.title })
+            .from(issues)
+            .where(and(eq(issues.assigneeAgentId, agent.id), eq(issues.companyId, agent.companyId), inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"])))
+            .limit(10);
+          const triageDecision = await manifestTriage(agent, classification, issueSnapshots, reason);
+          if (triageDecision === "skip") {
+            await writeSkippedRequest("manifest_triage.skip", { countsForHeartbeatInterval: source === "timer" });
+            triageLog({ event: "manifest_triage_skip", agentId, agentName: agent.name });
+            return null;
+          }
+          if (triageDecision === "complex") {
+            triageLog({ event: "manifest_triage_complex", agentId, agentName: agent.name, model: "primary" });
+            // Don't set triageModelOverride — use primary model
+          } else {
+            enrichedContextSnapshot.triageModelOverride = policy.triageModel;
+            triageLog({ event: "triage_always", agentId, agentName: agent.name, model: policy.triageModel, source, manifestDecision: "routine" });
+          }
+        } else {
+          enrichedContextSnapshot.triageModelOverride = policy.triageModel;
+          triageLog({ event: "triage_always", agentId, agentName: agent.name, model: policy.triageModel, source });
+        }
         logger.info(
           { agentId, triageModel: policy.triageModel },
           "Heartbeat triage (always mode): using triage model for all scheduled wakes",
@@ -9105,6 +9222,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "Heartbeat triage: using lighter model for routine work",
           );
           triageLog({ event: "triage_downgrade", agentId, agentName: agent.name, complexity: classification.complexity, reason: classification.reason, model: policy.triageModel });
+        }
+
+        // Manifest triage: use cheap LLM to refine the SQL classification
+        if (policy.manifestTriageEnabled && classification.hasWork) {
+          const issueSnapshots = await db
+            .select({
+              identifier: issues.identifier,
+              status: issues.status,
+              priority: issues.priority,
+              title: issues.title,
+            })
+            .from(issues)
+            .where(
+              and(
+                eq(issues.assigneeAgentId, agent.id),
+                eq(issues.companyId, agent.companyId),
+                inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
+              ),
+            )
+            .limit(10);
+
+          const triageDecision = await manifestTriage(
+            agent,
+            classification,
+            issueSnapshots,
+            reason,
+          );
+
+          if (triageDecision === "skip") {
+            await writeSkippedRequest("manifest_triage.skip", {
+              countsForHeartbeatInterval: source === "timer",
+            });
+            publishLiveEvent({
+              companyId: agent.companyId,
+              type: "heartbeat.manifest_triage.skipped",
+              payload: { agentId, source, reason: "manifest_triage_skip" },
+            });
+            triageLog({ event: "manifest_triage_skip", agentId, agentName: agent.name });
+            return null;
+          }
+
+          // Manifest says complex but SQL said routine — upgrade to primary model
+          if (triageDecision === "complex" && enrichedContextSnapshot.triageModelOverride) {
+            delete enrichedContextSnapshot.triageModelOverride;
+            triageLog({ event: "manifest_triage_upgrade", agentId, agentName: agent.name, from: "routine", to: "complex" });
+            logger.info({ agentId }, "Manifest triage upgraded routine work to complex — using primary model");
+          }
         }
       }
     }
