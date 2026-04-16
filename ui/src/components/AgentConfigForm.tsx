@@ -1492,6 +1492,24 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 )}
                 onChange={(v) => mark("heartbeat", "alwaysRun", v)}
               />
+              <Field label="Heartbeat adapter" hint={help.heartbeatAdapterType}>
+                <select
+                  value={eff(
+                    "heartbeat",
+                    "heartbeatAdapterType",
+                    String(heartbeat.heartbeatAdapterType ?? ""),
+                  )}
+                  onChange={(e) => mark("heartbeat", "heartbeatAdapterType", e.target.value)}
+                  className={inputClass}
+                >
+                  <option value="">Default (use agent adapter)</option>
+                  <option value="manifest">Manifest (tier-routed LLM)</option>
+                  <option value="manifest_triage">Manifest + Triage (SKIP/ROUTINE/COMPLEX)</option>
+                  <option value="openrouter_local">OpenRouter (direct)</option>
+                  <option value="claude_local">Claude Code</option>
+                  <option value="codex_local">Codex</option>
+                </select>
+              </Field>
               <Field label="Triage mode" hint={help.triageMode}>
                 <select
                   value={eff(
