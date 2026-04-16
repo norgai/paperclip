@@ -8127,7 +8127,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
         );
       }
       triageLog({ event: "adapter_execute", agentId: agent.id, agentName: agent.name, adapter: effectiveAdapterType, model: effectiveConfig.model ?? "default", runId: run.id });
-      const adapterResult = await adapter.execute({
+      let adapterResult = await adapter.execute({
         runId: run.id,
         agent: gatewayDecision
           ? { ...agent, adapterType: effectiveAdapterType }
@@ -8154,6 +8154,36 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
         },
         authToken: authToken ?? undefined,
       });
+
+      // Tooling handoff: if the heartbeat adapter signals it needs full tooling,
+      // re-dispatch with the agent's primary adapter (e.g. claude_local).
+      if (adapterResult.requiresTooling && heartbeatAdapterOverride && agent.adapterType && heartbeatAdapterOverride !== agent.adapterType) {
+        const primaryAdapter = getServerAdapter(agent.adapterType);
+        if (primaryAdapter) {
+          triageLog({ event: "tooling_handoff", agentId: agent.id, agentName: agent.name, from: effectiveAdapterType, to: agent.adapterType, summary: adapterResult.summary?.slice(0, 200) });
+          await onLog("stdout", `[paperclip] Tooling handoff: ${effectiveAdapterType} → ${agent.adapterType} (requiresTooling=true)\n`);
+          // Pass the manifest run's summary as handoff context
+          context.paperclipSessionHandoffMarkdown = `## Triage Handoff\n\nThe lightweight adapter determined this task requires full tooling.\n\n**Summary:** ${adapterResult.summary ?? "No summary provided."}\n\nProceed with the work described above. You have full file system access, bash, git, and MCP tools.`;
+          const primaryConfig = resolvedConfig;
+          const primaryAuthToken = primaryAdapter.supportsLocalAgentJwt
+            ? createLocalAgentJwt(agent.id, agent.companyId, agent.adapterType, run.id)
+            : null;
+          adapterResult = await primaryAdapter.execute({
+            runId: run.id,
+            agent,
+            runtime: runtimeForAdapter,
+            config: primaryConfig,
+            context,
+            onLog,
+            onMeta: onAdapterMeta,
+            onSpawn: async (meta) => {
+              await persistRunProcessMetadata(run.id, meta);
+            },
+            authToken: primaryAuthToken ?? undefined,
+          });
+          triageLog({ event: "tooling_handoff_complete", agentId: agent.id, agentName: agent.name, adapter: agent.adapterType, runId: run.id });
+        }
+      }
       const adapterManagedRuntimeServices = adapterResult.runtimeServices
         ? await persistAdapterManagedRuntimeServices({
             db,

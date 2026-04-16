@@ -91,6 +91,13 @@ export interface AdapterExecutionResult {
   runtimeServices?: AdapterRuntimeServiceReport[];
   summary?: string | null;
   clearSession?: boolean;
+  /**
+   * When true, the heartbeat system re-dispatches this run with the agent's
+   * primary adapter (e.g. claude_local) instead of the heartbeat adapter.
+   * Use when the cheap heartbeat adapter determines the task needs full
+   * tooling (file access, bash, git, MCP) that it cannot provide.
+   */
+  requiresTooling?: boolean;
   question?: {
     prompt: string;
     choices: Array<{

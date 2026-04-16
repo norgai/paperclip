@@ -370,14 +370,30 @@ const MANIFEST_API_KEY = process.env.MANIFEST_API_KEY || "";
 const MANIFEST_TRIAGE_URL = process.env.MANIFEST_TRIAGE_URL || "https://openrouter.ai/api/v1/chat/completions";
 const MANIFEST_TRIAGE_API_KEY = process.env.MANIFEST_TRIAGE_API_KEY || process.env.OPEN_ROUTER_KEY || "";
 
+const TOOLING_HANDOFF_INSTRUCTION = `
+
+IMPORTANT: You have limited tools (issue management only). You do NOT have file system access, bash, git, code editing, or MCP tools.
+If the task requires ANY of the following, respond with EXACTLY "[REQUIRES_TOOLING]" on a line by itself, followed by a one-paragraph summary of what the full-tooling agent needs to do:
+- Writing, editing, or reading code files
+- Running shell commands or scripts
+- Git operations (commit, push, branch, PR)
+- Database queries or migrations
+- MCP tool calls (content-craft, monday, etc.)
+- Installing packages or dependencies
+- Browser testing or screenshots
+
+For tasks you CAN handle (posting comments, updating issue status, checking assignments, reading issue descriptions, triaging work), proceed normally without the handoff signal.`;
+
 const manifestAdapter: ServerAdapterModule = {
   type: "manifest",
   execute: async (ctx) => {
+    const existingSystemPrompt = (ctx.config as Record<string, unknown>).systemPrompt as string || "";
     const config = {
       ...ctx.config,
       baseUrl: (ctx.config as Record<string, unknown>).baseUrl || MANIFEST_URL,
       apiKey: (ctx.config as Record<string, unknown>).apiKey || MANIFEST_API_KEY,
       model: (ctx.config as Record<string, unknown>).model || "manifest/auto",
+      systemPrompt: existingSystemPrompt + TOOLING_HANDOFF_INSTRUCTION,
     };
     return openRouterExecute({ ...ctx, config });
   },

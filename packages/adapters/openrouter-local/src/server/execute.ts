@@ -563,7 +563,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   await onLog("stdout", `${responseText}\n`);
-  await onLog("stdout", `[paperclip] OpenRouter done: model=${model} in=${inputTokens} out=${outputTokens}\n`);
+
+  // Detect tooling handoff signal: if the LLM says it needs full tooling,
+  // return requiresTooling so heartbeat.ts re-dispatches with the primary adapter.
+  const requiresTooling = responseText.includes("[REQUIRES_TOOLING]");
+  if (requiresTooling) {
+    await onLog("stdout", `[paperclip] Tooling handoff requested — will re-dispatch to primary adapter\n`);
+  }
+
+  await onLog("stdout", `[paperclip] OpenRouter done: model=${model} in=${inputTokens} out=${outputTokens}${requiresTooling ? " [HANDOFF]" : ""}\n`);
 
   return {
     exitCode: 0,
@@ -575,6 +583,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     biller: "openrouter",
     billingType: "api",
     model,
-    summary: responseText.slice(0, 500),
+    summary: requiresTooling
+      ? responseText.replace("[REQUIRES_TOOLING]", "").trim().slice(0, 500)
+      : responseText.slice(0, 500),
+    requiresTooling,
   };
 }
