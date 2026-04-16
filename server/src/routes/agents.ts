@@ -82,6 +82,8 @@ export function agentRoutes(db: Db) {
     cursor: "instructionsFilePath",
     pi_local: "instructionsFilePath",
     openrouter_local: "instructionsFilePath",
+    manifest: "instructionsFilePath",
+    manifest_triage: "instructionsFilePath",
   };
   const DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES = new Set(Object.keys(DEFAULT_INSTRUCTIONS_PATH_KEYS));
   const KNOWN_INSTRUCTIONS_PATH_KEYS = new Set(["instructionsFilePath", "agentsMdPath"]);

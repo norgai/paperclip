@@ -94,6 +94,16 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Hundreds of AI models via OpenRouter API",
     icon: Sparkles,
   },
+  manifest: {
+    label: "Manifest",
+    description: "Local Manifest LLM router with tier-based model selection",
+    icon: Sparkles,
+  },
+  manifest_triage: {
+    label: "Manifest + Triage",
+    description: "Manifest router with cheap triage pre-check (SKIP/ROUTINE/COMPLEX)",
+    icon: Sparkles,
+  },
   openclaw_gateway: {
     label: "OpenClaw Gateway",
     description: "Invoke OpenClaw via gateway protocol",
