@@ -3457,7 +3457,11 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
       if (gatewayBypassed) {
         logger.debug({ agentId: agent.id }, "Gateway bypassed for agent (metadata.gatewayBypass=true)");
       }
-      const effectiveAdapterType = gatewayDecision?.adapterType ?? agent.adapterType;
+      // Heartbeat adapter override: use a different adapter for heartbeat runs
+      // (e.g. manifest or manifest_triage) while keeping claude_local for on-demand work.
+      const heartbeatCfgForAdapter = parseObject(parseObject(agent.runtimeConfig).heartbeat);
+      const heartbeatAdapterOverride = asString(heartbeatCfgForAdapter.heartbeatAdapterType, "");
+      const effectiveAdapterType = heartbeatAdapterOverride || gatewayDecision?.adapterType || agent.adapterType;
       const adapter = getServerAdapter(effectiveAdapterType);
 
       // Apply gateway model/timeout/adapter-config overrides
