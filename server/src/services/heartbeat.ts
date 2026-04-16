@@ -2869,7 +2869,7 @@ export function heartbeatService(db: Db) {
       // sessions built with a larger model (prompt too long)
       forceNewSession = true;
       // Also cap max turns for triage runs to keep them lightweight
-      runtimeConfig = { ...runtimeConfig, maxTurnsPerRun: Math.min(runtimeConfig.maxTurnsPerRun ?? 300, 5) };
+      runtimeConfig = { ...runtimeConfig, maxTurnsPerRun: Math.min(runtimeConfig.maxTurnsPerRun ?? 300, 30) };
     }
     const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
       companyId: agent.companyId,
