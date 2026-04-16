@@ -2292,6 +2292,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
       triageMode: asString(heartbeat.triageMode, process.env.HEARTBEAT_TRIAGE_MODE || "preflight") as "preflight" | "always" | "off",
       manifestTriageEnabled: asBoolean(heartbeat.manifestTriageEnabled, process.env.MANIFEST_TRIAGE_ENABLED === "true"),
       alwaysRun: asBoolean(heartbeat.alwaysRun, false),
+      manifestAdapterEnabled: asBoolean(heartbeat.manifestAdapterEnabled, process.env.MANIFEST_ADAPTER_ENABLED === "true"),
     };
   }
 
@@ -2992,6 +2993,25 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
       // Cap max turns for triage runs to keep them lightweight
       runtimeConfig = { ...runtimeConfig, maxTurnsPerRun: Math.min(runtimeConfig.maxTurnsPerRun ?? 300, 30) };
     }
+    // Manifest adapter: inject proxy env vars so Claude Code CLI routes through Manifest
+    const manifestProxyUrl = process.env.MANIFEST_ADAPTER_PROXY_URL || "http://127.0.0.1:3456";
+    const manifestProxyKey = process.env.MANIFEST_ADAPTER_PROXY_KEY || "manifest-proxy";
+    const heartbeatCfg = parseObject(parseObject(agent.runtimeConfig).heartbeat);
+    const manifestAdapterOn = asBoolean(heartbeatCfg.manifestAdapterEnabled, process.env.MANIFEST_ADAPTER_ENABLED === "true");
+    const alwaysRunOn = asBoolean(heartbeatCfg.alwaysRun, false);
+    if (manifestAdapterOn && !alwaysRunOn) {
+      const existingEnv = parseObject(runtimeConfig.env);
+      runtimeConfig = {
+        ...runtimeConfig,
+        env: {
+          ...existingEnv,
+          ANTHROPIC_BASE_URL: manifestProxyUrl,
+          ANTHROPIC_API_KEY: manifestProxyKey,
+        },
+      };
+      triageLog({ event: "manifest_adapter", agentId: agent.id, agentName: agent.name, proxyUrl: manifestProxyUrl });
+    }
+
     const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
       companyId: agent.companyId,
       heartbeatRunId: run.id,
