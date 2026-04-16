@@ -5941,6 +5941,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
       triageModel: asString(heartbeat.triageModel, process.env.HEARTBEAT_TRIAGE_MODEL || ""),
       triageMode: asString(heartbeat.triageMode, process.env.HEARTBEAT_TRIAGE_MODE || "preflight") as "preflight" | "always" | "off",
       manifestTriageEnabled: asBoolean(heartbeat.manifestTriageEnabled, process.env.MANIFEST_TRIAGE_ENABLED === "true"),
+      alwaysRun: asBoolean(heartbeat.alwaysRun, false),
     };
   }
 
@@ -9144,7 +9145,11 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
     // Only applies to timer and automation sources.
 
     // "always" triage mode: skip SQL preflight, use triage model for all timer/automation wakes
-    if (policy.triageMode === "always" && policy.triageModel && (source === "timer" || source === "automation")) {
+    // alwaysRun: skip all triage and run the primary model every heartbeat
+    if (policy.alwaysRun && (source === "timer" || source === "automation")) {
+      triageLog({ event: "always_run", agentId, agentName: agent.name, source });
+      // No triage override — use primary model directly
+    } else if (policy.triageMode === "always" && policy.triageModel && (source === "timer" || source === "automation")) {
       const hasExplicitTarget =
         readNonEmptyString(enrichedContextSnapshot.issueId) ||
         readNonEmptyString(enrichedContextSnapshot.commentId) ||
@@ -9190,7 +9195,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
       }
     }
 
-    if (policy.preflightEnabled && policy.triageMode !== "always" && (source === "timer" || source === "automation")) {
+    if (policy.preflightEnabled && policy.triageMode !== "always" && !policy.alwaysRun && (source === "timer" || source === "automation")) {
       triageLog({ event: "preflight_start", agentId, agentName: agent.name, source, reason });
       const hasExplicitTarget =
         readNonEmptyString(enrichedContextSnapshot.issueId) ||
