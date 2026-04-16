@@ -108,6 +108,11 @@ const adapterDisplayMap: Record<string, AdapterDisplayInfo> = {
     description: "Managed remote Cursor agent",
     icon: MousePointer2,
   },
+  openrouter_local: {
+    label: "OpenRouter",
+    description: "Hundreds of AI models via OpenRouter API",
+    icon: Sparkles,
+  },
   openclaw_gateway: {
     label: "OpenClaw Gateway",
     description: "Invoke OpenClaw via gateway protocol",

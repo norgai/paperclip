@@ -90,6 +90,14 @@ import {
   models as grokModels,
 } from "@paperclipai/adapter-grok-local";
 import {
+  execute as openRouterExecute,
+  testEnvironment as openRouterTestEnvironment,
+  listOpenRouterSkills,
+  syncOpenRouterSkills,
+  getQuotaWindows as openRouterGetQuotaWindows,
+} from "@paperclipai/adapter-openrouter-local/server";
+import { agentConfigurationDoc as openRouterAgentConfigurationDoc, models as openRouterModels } from "@paperclipai/adapter-openrouter-local";
+import {
   execute as openCodeExecute,
   listOpenCodeSkills,
   syncOpenCodeSkills,
@@ -341,6 +349,18 @@ const cursorCloudAdapter: ServerAdapterModule = {
   getConfigSchema: getCursorCloudConfigSchema,
 };
 
+const openRouterLocalAdapter: ServerAdapterModule = {
+  type: "openrouter_local",
+  execute: openRouterExecute,
+  testEnvironment: openRouterTestEnvironment,
+  listSkills: listOpenRouterSkills,
+  syncSkills: syncOpenRouterSkills,
+  models: openRouterModels,
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: openRouterAgentConfigurationDoc,
+  getQuotaWindows: openRouterGetQuotaWindows,
+};
+
 const geminiLocalAdapter: ServerAdapterModule = {
   type: "gemini_local",
   execute: geminiExecute,
@@ -519,6 +539,7 @@ function registerBuiltInAdapters() {
     cursorLocalAdapter,
     geminiLocalAdapter,
     grokLocalAdapter,
+    openRouterLocalAdapter,
     openclawGatewayAdapter,
     hermesLocalAdapter,
     processAdapter,
