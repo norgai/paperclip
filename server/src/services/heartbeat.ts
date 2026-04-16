@@ -7369,11 +7369,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }
         } catch { /* directory not found, use 0 */ }
       }
-      // Estimate total prompt tokens: instructions + Paperclip skill (~6K tokens) + Claude system (~30K tokens)
+      // Estimate total prompt tokens: instructions + Claude Code system + Paperclip skill + tool defs
+      // Real-world measurement: Product Owner (38KB instructions) = 138K cached tokens total.
+      // That implies ~127K tokens of overhead (Claude system + Paperclip skill + MCP tools).
       const estimatedInstructionTokens = Math.ceil(totalInstructionBytes / 3.5);
-      const estimatedTotalPromptTokens = estimatedInstructionTokens + 36_000;
-      // Model context budgets (leave 40% headroom for conversation + tool results)
-      const HAIKU_SAFE_LIMIT = 120_000;   // Haiku 200K ctx, 60% for prompt
+      const SYSTEM_OVERHEAD_TOKENS = 130_000;  // Claude Code system + Paperclip skill + tool definitions
+      const estimatedTotalPromptTokens = estimatedInstructionTokens + SYSTEM_OVERHEAD_TOKENS;
+      // Haiku 200K context: need ~50K tokens free for conversation + tool results (3-4 API calls)
+      const HAIKU_SAFE_LIMIT = 155_000;   // Haiku 200K ctx, leaving 45K for conversation
       let effectiveTriageModel = triageModelOverride;
       if (estimatedTotalPromptTokens > HAIKU_SAFE_LIMIT && triageModelOverride.includes("haiku")) {
         // Prompt too large for Haiku — upgrade to Sonnet
