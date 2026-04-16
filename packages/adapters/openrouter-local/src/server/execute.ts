@@ -307,9 +307,19 @@ async function executeTool(
       return JSON.stringify(result, null, 2);
     }
     if (name === "get_issue") {
-      const issueId = encodeURIComponent(String(args.issueId ?? ""));
-      const result = await pcFetch(serverUrl, `/companies/${companyId}/issues/${issueId}`, "GET", token);
-      return JSON.stringify(result, null, 2);
+      const issueId = String(args.issueId ?? "");
+      // Try direct UUID lookup first, fall back to search by identifier
+      try {
+        const result = await pcFetch(serverUrl, `/issues/${encodeURIComponent(issueId)}`, "GET", token);
+        return JSON.stringify(result, null, 2);
+      } catch {
+        // Identifier lookup (e.g. NOR-3) via search
+        const results = await pcFetch(serverUrl, `/companies/${companyId}/issues?q=${encodeURIComponent(issueId)}`, "GET", token);
+        if (Array.isArray(results) && results.length > 0) {
+          return JSON.stringify(results[0], null, 2);
+        }
+        return `Issue "${issueId}" not found.`;
+      }
     }
     if (name === "create_issue") {
       const result = await pcFetch(serverUrl, `/companies/${companyId}/issues`, "POST", token, {
@@ -322,12 +332,15 @@ async function executeTool(
     }
     if (name === "update_issue") {
       const { issueId, ...patch } = args;
-      const result = await pcFetch(serverUrl, `/companies/${companyId}/issues/${encodeURIComponent(String(issueId))}`, "PATCH", token, patch);
+      const result = await pcFetch(serverUrl, `/issues/${encodeURIComponent(String(issueId))}`, "PATCH", token, patch);
       return JSON.stringify(result, null, 2);
     }
     if (name === "checkout_issue") {
       const issueId = encodeURIComponent(String(args.issueId ?? ""));
-      const result = await pcFetch(serverUrl, `/issues/${issueId}/checkout`, "POST", token, {});
+      const result = await pcFetch(serverUrl, `/issues/${issueId}/checkout`, "POST", token, {
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
       return JSON.stringify(result, null, 2);
     }
     if (name === "post_comment") {
