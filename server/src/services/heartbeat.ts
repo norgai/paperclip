@@ -7350,15 +7350,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
 
     // Apply triage model override from enqueueWakeup (set by preflight/always triage)
-    // Apply triage model override from enqueueWakeup (set by preflight/always triage)
+    // Size-aware model selection: measure instruction files and pick a model
+    // that can fit the full prompt without autocompact thrashing.
     const triageModelOverride = readNonEmptyString(context.triageModelOverride);
     let forceNewSession = false;
     if (triageModelOverride) {
-      runtimeConfig = { ...runtimeConfig, model: triageModelOverride };
+      // Measure total instruction file size for this agent
+      const instructionsRoot = asString(config.instructionsRootPath, "");
+      let totalInstructionBytes = 0;
+      if (instructionsRoot) {
+        try {
+          const dirFiles = await fs.readdir(instructionsRoot);
+          for (const f of dirFiles) {
+            try {
+              const fstat = await fs.stat(path.join(instructionsRoot, f));
+              if (fstat.isFile()) totalInstructionBytes += fstat.size;
+            } catch { /* skip unreadable files */ }
+          }
+        } catch { /* directory not found, use 0 */ }
+      }
+      // Estimate total prompt tokens: instructions + Paperclip skill (~6K tokens) + Claude system (~30K tokens)
+      const estimatedInstructionTokens = Math.ceil(totalInstructionBytes / 3.5);
+      const estimatedTotalPromptTokens = estimatedInstructionTokens + 36_000;
+      // Model context budgets (leave 40% headroom for conversation + tool results)
+      const HAIKU_SAFE_LIMIT = 120_000;   // Haiku 200K ctx, 60% for prompt
+      let effectiveTriageModel = triageModelOverride;
+      if (estimatedTotalPromptTokens > HAIKU_SAFE_LIMIT && triageModelOverride.includes("haiku")) {
+        // Prompt too large for Haiku — upgrade to Sonnet
+        effectiveTriageModel = "claude-sonnet-4-6";
+        triageLog({ event: "triage_model_upgrade", agentId: agent.id, agentName: agent.name, from: triageModelOverride, to: effectiveTriageModel, reason: "prompt_too_large", instructionBytes: totalInstructionBytes, estimatedTokens: estimatedTotalPromptTokens });
+        logger.info({ agentId: agent.id, from: triageModelOverride, to: effectiveTriageModel, instructionBytes: totalInstructionBytes, estimatedTokens: estimatedTotalPromptTokens }, "Triage model upgraded: instructions too large for Haiku context");
+      } else {
+        triageLog({ event: "triage_model_ok", agentId: agent.id, agentName: agent.name, model: effectiveTriageModel, instructionBytes: totalInstructionBytes, estimatedTokens: estimatedTotalPromptTokens });
+      }
+      runtimeConfig = { ...runtimeConfig, model: effectiveTriageModel };
       // Force fresh session — triage uses a smaller model that cannot resume
-      // sessions built with a larger model (prompt too long)
       forceNewSession = true;
-      // Also cap max turns for triage runs to keep them lightweight
+      // Cap max turns for triage runs to keep them lightweight
       runtimeConfig = { ...runtimeConfig, maxTurnsPerRun: Math.min(runtimeConfig.maxTurnsPerRun ?? 300, 30) };
     }
     const workspaceOperationRecorder = workspaceOperationsSvc.createRecorder({
