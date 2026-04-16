@@ -1151,6 +1151,16 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
                 )}
                 onChange={(v) => mark("heartbeat", "preflightEnabled", v)}
               />
+              <Toggle
+                label="Always run (skip triage)"
+                hint={help.alwaysRun}
+                checked={eff(
+                  "heartbeat",
+                  "alwaysRun",
+                  heartbeat.alwaysRun === true,
+                )}
+                onChange={(v) => mark("heartbeat", "alwaysRun", v)}
+              />
               <Field label="Triage mode" hint={help.triageMode}>
                 <select
                   value={eff(

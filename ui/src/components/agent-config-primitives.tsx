@@ -58,6 +58,7 @@ export const help: Record<string, string> = {
   preflightEnabled: "Skip heartbeat entirely when no pending work exists (assigned issues, new comments, or approvals). Saves tokens on idle agents.",
   triageMode: "How to select model for heartbeat runs. Preflight: use SQL check to classify work complexity, downgrade routine work to triage model. Always: always use triage model for scheduled heartbeats. Off: disabled.",
   triageModel: "Lighter model used for routine heartbeat work (blocked tasks, status checks, comment replies). e.g. claude-haiku-4-5",
+  alwaysRun: "Skip all triage layers and run the primary model every heartbeat. Use for agents that must execute every cycle (e.g. periodic health checks, scheduled audits).",
   budgetMonthlyCents: "Monthly spending limit in cents. 0 means no limit.",
 };
 
