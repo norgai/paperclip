@@ -361,6 +361,117 @@ const openRouterLocalAdapter: ServerAdapterModule = {
   getQuotaWindows: openRouterGetQuotaWindows,
 };
 
+// ---------------------------------------------------------------------------
+// Manifest adapters — wrap openrouter_local, pointing at local Manifest LLM router
+// ---------------------------------------------------------------------------
+
+const MANIFEST_URL = process.env.MANIFEST_URL || "http://127.0.0.1:2099/v1";
+const MANIFEST_API_KEY = process.env.MANIFEST_API_KEY || "";
+const MANIFEST_TRIAGE_URL = process.env.MANIFEST_TRIAGE_URL || "https://openrouter.ai/api/v1/chat/completions";
+const MANIFEST_TRIAGE_API_KEY = process.env.MANIFEST_TRIAGE_API_KEY || process.env.OPEN_ROUTER_KEY || "";
+
+const manifestAdapter: ServerAdapterModule = {
+  type: "manifest",
+  execute: async (ctx) => {
+    const config = {
+      ...ctx.config,
+      baseUrl: (ctx.config as Record<string, unknown>).baseUrl || MANIFEST_URL,
+      apiKey: (ctx.config as Record<string, unknown>).apiKey || MANIFEST_API_KEY,
+      model: (ctx.config as Record<string, unknown>).model || "manifest/auto",
+    };
+    return openRouterExecute({ ...ctx, config });
+  },
+  testEnvironment: openRouterTestEnvironment,
+  listSkills: listOpenRouterSkills,
+  syncSkills: syncOpenRouterSkills,
+  models: [
+    { id: "manifest/auto", label: "Manifest Auto (tier-routed)" },
+    { id: "manifest/simple", label: "Manifest Simple (cheapest)" },
+    { id: "manifest/standard", label: "Manifest Standard" },
+    { id: "manifest/complex", label: "Manifest Complex" },
+    { id: "manifest/reasoning", label: "Manifest Reasoning" },
+  ],
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: `# manifest adapter
+
+Routes through the local Manifest LLM router (OpenAI-compatible).
+Manifest handles model selection via tiers (simple/standard/complex/reasoning).
+
+Config:
+- model: "manifest/auto" (default) or specific tier
+- baseUrl: Manifest endpoint (default: ${MANIFEST_URL})
+- apiKey: Manifest API key (default from MANIFEST_API_KEY env)
+- All other openrouter_local fields are supported
+`,
+};
+
+const manifestTriageAdapter: ServerAdapterModule = {
+  type: "manifest_triage",
+  execute: async (ctx) => {
+    // Triage pre-check: lightweight LLM call to decide if we should run
+    const triageUrl = (ctx.config as Record<string, unknown>).triageUrl as string || MANIFEST_TRIAGE_URL;
+    const triageKey = (ctx.config as Record<string, unknown>).triageApiKey as string || MANIFEST_TRIAGE_API_KEY;
+    const triageModel = (ctx.config as Record<string, unknown>).triageModel as string || "liquid/lfm-2.5-1.2b-instruct:free";
+
+    if (triageKey) {
+      try {
+        const wakeReason = (ctx.context.wakeReason as string) || "heartbeat";
+        const prompt = `Triage: should agent "${ctx.agent.name}" (${ctx.agent.role || "general"}) run this heartbeat? Wake reason: ${wakeReason}. One word: SKIP, ROUTINE, or COMPLEX.`;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 8000);
+        const resp = await fetch(triageUrl, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${triageKey}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ model: triageModel, messages: [{ role: "user", content: prompt }], max_tokens: 10, temperature: 0 }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (resp.ok) {
+          const data = await resp.json() as { choices?: Array<{ message?: { content?: string } }> };
+          const answer = (data.choices?.[0]?.message?.content ?? "").trim().toUpperCase();
+          if (answer.includes("SKIP")) {
+            return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Triage: skipped (no actionable work)", clearSession: false };
+          }
+          // ROUTINE or COMPLEX — continue to manifest execute
+          if (answer.includes("ROUTINE")) {
+            (ctx.config as Record<string, unknown>).maxSteps = Math.min(Number((ctx.config as Record<string, unknown>).maxSteps) || 20, 10);
+          }
+        }
+      } catch { /* triage error — proceed with full run */ }
+    }
+
+    // Delegate to manifest adapter execute
+    const config = {
+      ...ctx.config,
+      baseUrl: (ctx.config as Record<string, unknown>).baseUrl || MANIFEST_URL,
+      apiKey: (ctx.config as Record<string, unknown>).apiKey || MANIFEST_API_KEY,
+      model: (ctx.config as Record<string, unknown>).model || "manifest/auto",
+    };
+    return openRouterExecute({ ...ctx, config });
+  },
+  testEnvironment: openRouterTestEnvironment,
+  listSkills: listOpenRouterSkills,
+  syncSkills: syncOpenRouterSkills,
+  models: [
+    { id: "manifest/auto", label: "Manifest Auto + Triage (tier-routed)" },
+  ],
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: `# manifest_triage adapter
+
+Triage pre-check + Manifest LLM router. Before each run, a cheap LLM call
+classifies the heartbeat as SKIP/ROUTINE/COMPLEX. SKIP exits immediately
+(zero tokens). ROUTINE runs with reduced steps. COMPLEX runs fully.
+
+Config:
+- triageModel: cheap model for pre-check (default: liquid/lfm-2.5-1.2b-instruct:free)
+- triageUrl: triage LLM endpoint (default: OpenRouter)
+- triageApiKey: API key for triage endpoint
+- model: "manifest/auto" (default)
+- baseUrl: Manifest endpoint
+- apiKey: Manifest API key
+`,
+};
+
 const geminiLocalAdapter: ServerAdapterModule = {
   type: "gemini_local",
   execute: geminiExecute,
@@ -540,6 +651,8 @@ function registerBuiltInAdapters() {
     geminiLocalAdapter,
     grokLocalAdapter,
     openRouterLocalAdapter,
+    manifestAdapter,
+    manifestTriageAdapter,
     openclawGatewayAdapter,
     hermesLocalAdapter,
     processAdapter,
