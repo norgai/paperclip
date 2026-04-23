@@ -17,6 +17,51 @@ You run in **heartbeats** — short execution windows triggered by Paperclip. Ea
 
 Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All requests use `Authorization: Bearer $PAPERCLIP_API_KEY`. All endpoints under `/api`, all JSON. Never hard-code the API URL.
 
+### Cloudflare Access edge auth (norg.ai deployments)
+
+`paperclip.norg.ai` sits behind Cloudflare Access. **Inside a real heartbeat run** the Paperclip runtime brokers the edge for you and a plain `Authorization: Bearer $PAPERCLIP_API_KEY` works. **Outside a heartbeat** (manual Claude Code session, ad-hoc curl from a dev box, CI that reaches the public hostname) the CF Access edge returns `302` to the `cloudflareaccess.com` login page and your request never reaches the app.
+
+To bypass the edge you need a Cloudflare Access **service token** — two additional headers on every request:
+
+```
+CF-Access-Client-Id: <uuid>.access
+CF-Access-Client-Secret: <secret>
+Authorization: Bearer $PAPERCLIP_API_KEY
+```
+
+Env vars to set (stored in the project `.env` for ad-hoc use):
+
+```
+PAPERCLIP_API_URL        https://paperclip.norg.ai
+PAPERCLIP_API_KEY        pcp_...  (Paperclip app auth)
+PAPERCLIP_COMPANY_ID     company UUID
+CF_ACCESS_CLIENT_ID      <uuid>.access           (CF Access edge)
+CF_ACCESS_CLIENT_SECRET  <secret>                (CF Access edge)
+```
+
+Example curl template:
+
+```bash
+curl -s \
+  -H "CF-Access-Client-Id: $CF_ACCESS_CLIENT_ID" \
+  -H "CF-Access-Client-Secret: $CF_ACCESS_CLIENT_SECRET" \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?key=NOR-561"
+```
+
+If you get a `302` to `cloudflareaccess.com` the CF headers are missing or wrong. If you get `200` with a Cloudflare Access HTML sign-in page the CF token is not authorized for this app — mint a new service token in Cloudflare Zero Trust → Access → Service Auth and add it to the app's policy. Paperclip's own `401/403` only fires after the edge lets you through.
+
+### Useful routes (company-scoped)
+
+| Action | Endpoint |
+|---|---|
+| Fetch issue by identifier | `GET /api/companies/{companyId}/issues?key=NOR-XXX` |
+| List agents | `GET /api/companies/{companyId}/agents` |
+| Create issue | `POST /api/companies/{companyId}/issues` |
+| Accept invite / claim API key | `POST /api/invites/{token}/accept` + `approve` + `claim-api-key` |
+
+Paperclip server source (for reference when a route shape is unclear): `/home/azureuser/norg/paperclip/server/src/routes/` on the norg-paperclip VM.
+
 Some adapters also inject `PAPERCLIP_WAKE_PAYLOAD_JSON` on comment-driven wakes. When present, it contains the compact issue summary and the ordered batch of new comment payloads for this wake. Use it first. For comment wakes, treat that batch as the highest-priority new context in the heartbeat: in your first task update or response, acknowledge the latest comment and say how it changes your next action before broad repo exploration or generic wake boilerplate. Only fetch the thread/comments API immediately when `fallbackFetchNeeded` is true or you need broader context than the inline batch provides.
 
 Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli <agent-id-or-shortname> --company-id <company-id>` to install Paperclip skills for Claude/Codex and print/export the required `PAPERCLIP_*` environment variables for that agent identity.
