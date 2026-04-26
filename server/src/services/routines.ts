@@ -1158,9 +1158,51 @@ export function routineService(
     });
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
-      await tx.execute(
-        sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update`,
-      );
+      // FOR UPDATE NOWAIT: serialise dispatch with a row-level lock on the
+      // routine, but never queue. If another dispatch is already mid-flight
+      // for the same routine, postgres raises 55P03 (lock_not_available)
+      // immediately and we coalesce this run rather than waiting.
+      //
+      // Why not plain FOR UPDATE: the dispatch transaction can be slow
+      // (issueSvc.create + queueIssueAssignmentWakeup do work that may take
+      // many seconds, and external services can stall). Queueing behind a
+      // slow dispatch causes every concurrent tick to pile up, exhausting
+      // the connection pool and making the API unresponsive (paperclip-norg
+      // 2026-04-26 incident: 9-deep stack of waiters held the API down for
+      // ~50 minutes per stuck tick).
+      try {
+        await tx.execute(
+          sql`select id from ${routines} where ${routines.id} = ${input.routine.id} and ${routines.companyId} = ${input.routine.companyId} for update nowait`,
+        );
+      } catch (lockError) {
+        const isLockNotAvailable =
+          !!lockError &&
+          typeof lockError === "object" &&
+          "code" in lockError &&
+          (lockError as { code?: string }).code === "55P03";
+        if (!isLockNotAvailable) throw lockError;
+
+        // Another dispatch holds the lock — coalesce this run. Insert a
+        // routine_run row in `coalesced` state so observers see the tick
+        // happened and was intentionally skipped.
+        const triggeredAt = new Date();
+        const [coalescedRun] = await txDb
+          .insert(routineRuns)
+          .values({
+            companyId: input.routine.companyId,
+            routineId: input.routine.id,
+            triggerId: input.trigger?.id ?? null,
+            source: input.source,
+            status: "coalesced",
+            triggeredAt,
+            completedAt: triggeredAt,
+            idempotencyKey: input.idempotencyKey ?? null,
+            triggerPayload,
+            failureReason: "Concurrent dispatch in flight (FOR UPDATE NOWAIT)",
+          })
+          .returning();
+        return coalescedRun;
+      }
 
       if (input.idempotencyKey) {
         const existing = await txDb
