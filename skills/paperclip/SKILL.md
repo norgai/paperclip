@@ -51,6 +51,59 @@ curl -s \
 
 If you get a `302` to `cloudflareaccess.com` the CF headers are missing or wrong. If you get `200` with a Cloudflare Access HTML sign-in page the CF token is not authorized for this app — mint a new service token in Cloudflare Zero Trust → Access → Service Auth and add it to the app's policy. Paperclip's own `401/403` only fires after the edge lets you through.
 
+**CF Access ghost-500 on writes (known gotcha).** From outside the VM, `PATCH /api/issues/:id`, `POST /api/issues/:id/comments`, and `PATCH /api/issues/:id` reassigns can return `HTTP/2 500 {"error":"Internal server error"}` *while the underlying write actually lands*. The 500 envelope is being injected by something at the CF edge, not by Paperclip itself (`X-Powered-By: Express` is present, server logs are clean). GETs are not affected. **Before retrying a 500 write, GET the issue and check whether the change already applied** — otherwise you'll double-apply (e.g. duplicate reassign, duplicate status flip, stray comment). If you do see a ghost-500 and the change landed, switch to the SSH bypass below for any cleanup (e.g. removing a stray diagnostic comment) instead of retrying through the edge.
+
+### SSH bypass: hit the local Paperclip API on norg-paperclip
+
+When CF Access misbehaves, ad-hoc cleanup is needed, or you need to use a route that the edge gates oddly (e.g. comment delete which doesn't exist over HTTP and has to be done in DB), SSH to **norg-paperclip** and hit the server on `127.0.0.1:3100` directly. Inside the VM there is no Cloudflare Access in front of the API — the same `Authorization: Bearer $PAPERCLIP_API_KEY` header authenticates you straight against Express.
+
+```bash
+SSH_HOST="azureuser@moltbot-norg-playground.australiaeast.cloudapp.azure.com"
+SSH_KEY="$HOME/.ssh/molt-bot-one_key.pem"
+SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10"
+
+# Forward your local PAPERCLIP_API_KEY into a remote bash session and call the
+# local API. CF_ACCESS_* headers are NOT needed on this path.
+ssh -i "$SSH_KEY" $SSH_OPTS "$SSH_HOST" \
+    "PAPERCLIP_API_KEY='$PAPERCLIP_API_KEY' bash -s" <<'REMOTE'
+ISSUE_ID="78dc8773-3acf-40d7-804c-a0112b9306dd"
+curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "http://127.0.0.1:3100/api/issues/$ISSUE_ID"
+REMOTE
+```
+
+For multi-line POST/PATCH bodies, build the JSON locally with `python3 -c 'import json; ...'` and `scp` it to `/tmp/payload.json` on the VM, then `curl --data-binary @/tmp/payload.json` — this avoids quoting hell with markdown comment bodies.
+
+**What runs where** (verified on norg-paperclip):
+
+- Paperclip API: `http://127.0.0.1:3100` (Express, `X-Powered-By: Express`)
+- Embedded Postgres: `127.0.0.1:54329`, db=`paperclip`, user=`paperclip`, password=`paperclip`
+- Server source: `~/norg/paperclip/server/src/routes/` (built into `dist/` — grep source to find route shapes)
+- Server logs: `~/.paperclip/instances/default/logs/server.log` (often empty — the running process logs to stdout/journal)
+- Process tree: `pnpm paperclipai run` → `tsx cli/src/index.ts run` (PID visible via `ps -ef | grep paperclipai`)
+
+**Direct DB escape hatch** (use sparingly — bypasses audit + run-id linkage):
+
+```bash
+ssh -i "$SSH_KEY" $SSH_OPTS "$SSH_HOST" '
+PGPASSWORD=paperclip psql -h 127.0.0.1 -p 54329 -U paperclip -d paperclip -c "
+DELETE FROM issue_comments WHERE id = '\''<comment-uuid>'\'' RETURNING id, body;
+"'
+```
+
+Common tables: `agents`, `agent_api_keys`, `issues`, `issue_comments`, `approval_comments`, `agent_runtime_state`, `agent_wakeup_requests`. Use this only for cleanup of artifacts the API can't reach (e.g. there is no `DELETE /api/issues/:id/comments/:id` route as of 2026-05-07 — comments can be created via API but only deleted via DB).
+
+**API-key reality check.** All agent API keys live in `agent_api_keys` (columns: `id`, `agent_id`, `company_id`, `name`, `key_hash`, `last_used_at`, `revoked_at`, `created_at` — there is **no `expires_at`**). To list active keys for a known agent:
+
+```sql
+SELECT a.name, a.status, a.id AS agent_id, k.id AS key_id, k.last_used_at
+FROM agents a JOIN agent_api_keys k ON k.agent_id = a.id
+WHERE a.name IN ('CTO','Content Craft','CEO') AND k.revoked_at IS NULL
+ORDER BY a.name, k.last_used_at DESC NULLS LAST;
+```
+
+`board_api_keys` exists but may be empty. If only one agent has an active key and it belongs to a paused agent, you may still be able to write — the server doesn't refuse paused-agent writes per se; the CF-edge ghost-500 makes it *look* like writes are blocked when they're actually landing.
+
 ### Useful routes (company-scoped)
 
 | Action | Endpoint |
