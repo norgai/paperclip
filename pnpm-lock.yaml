@@ -656,7 +656,7 @@ importers:
         specifier: ^0.5.19
         version: 0.5.19(tailwindcss@4.1.18)
       '@tanstack/react-query':
-        specifier: ^5.90.21
+        specifier: 5.90.21
         version: 5.90.21(react@19.2.4)
       class-variance-authority:
         specifier: ^0.7.1
