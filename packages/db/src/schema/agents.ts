@@ -36,6 +36,8 @@ export const agents = pgTable(
     metadata: jsonb("metadata").$type<Record<string, unknown>>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    bundleRevisionId: text("bundle_revision_id"),
+    bundleAssembledAt: timestamp("bundle_assembled_at", { withTimezone: true }),
   },
   (table) => ({
     companyStatusIdx: index("agents_company_status_idx").on(table.companyId, table.status),
