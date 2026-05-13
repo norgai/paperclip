@@ -40,6 +40,7 @@ import {
   issueApprovalService,
   issueService,
   logActivity,
+  persistBundleRevision,
   secretService,
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
@@ -1836,6 +1837,58 @@ export function agentRoutes(db: Db) {
     });
 
     res.json(result.bundle);
+  });
+
+  // NOR-4835: Lazy bundle revision tracking. The compute is triggered on read
+  // of these two endpoints (CTO clarification cmt 0b5f5960). `bundleRevisionId`
+  // and `bundleAssembledAt` are surfaced on GET /agents/:id directly from the
+  // stored row; first read here is what populates them.
+
+  router.get("/agents/:id/bundle/revision", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    await assertCanReadAgent(req, existing);
+    const persisted = await persistBundleRevision(db, id);
+    if (!persisted) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    res.json({
+      agentId: id,
+      bundleRevisionId: persisted.bundleRevisionId,
+      bundleAssembledAt: persisted.bundleAssembledAt.toISOString(),
+      manifest: persisted.assembled.manifest,
+      entryFile: persisted.assembled.entryFile,
+      warnings: persisted.assembled.warnings,
+    });
+  });
+
+  router.get("/agents/:id/bundle", async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await svc.getById(id);
+    if (!existing) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    await assertCanReadAgent(req, existing);
+    const persisted = await persistBundleRevision(db, id);
+    if (!persisted) {
+      res.status(404).json({ error: "Agent not found" });
+      return;
+    }
+    res.json({
+      agentId: id,
+      bundleRevisionId: persisted.bundleRevisionId,
+      bundleAssembledAt: persisted.bundleAssembledAt.toISOString(),
+      manifest: persisted.assembled.manifest,
+      entryFile: persisted.assembled.entryFile,
+      warnings: persisted.assembled.warnings,
+      text: persisted.assembled.text,
+    });
   });
 
   router.patch("/agents/:id", validate(updateAgentSchema), async (req, res) => {
