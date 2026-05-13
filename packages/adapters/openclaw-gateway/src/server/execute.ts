@@ -784,6 +784,12 @@ class GatewayWsClient {
     this.ws = null;
   }
 
+  closeWithCode(code: number, reason: string) {
+    if (!this.ws) return;
+    this.ws.close(code, reason);
+    this.ws = null;
+  }
+
   private failPending(err: Error) {
     for (const [, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);
@@ -1098,6 +1104,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const connectTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, 15_000) : 10_000;
   const waitTimeoutMs = parseOptionalPositiveInteger(ctx.config.waitTimeoutMs) ?? (timeoutMs > 0 ? timeoutMs : 30_000);
 
+  // Protocol v2 pause-enforcement config (AC7)
+  const graceDrainTimeoutMs = parseOptionalPositiveInteger(ctx.config.graceDrainTimeoutMs) ?? 300_000;
+  const statusCheckBeforeDispatch = parseBoolean(ctx.config.statusCheckBeforeDispatch, true);
+  const paperclipStatusCheckUrl =
+    resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl) ??
+    (typeof process !== "undefined" ? (process.env.PAPERCLIP_API_URL ?? null) : null);
+
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
   const transportHint = nonEmpty(ctx.config.streamTransport) ?? nonEmpty(ctx.config.transport);
 
@@ -1212,6 +1225,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let lifecycleError: string | null = null;
     let deviceIdentity: GatewayDeviceIdentity | null = null;
 
+    // Protocol v2 pause-enforcement session state (NOR-4839)
+    let terminatedByPauseSignal = false;
+    let jobInFlight = false;
+    let pendingTermination = false;
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    let negotiatedFeatureProtocol = GATEWAY_FEATURE_PROTOCOL_DEFAULT;
+    const terminationRef: { client: GatewayWsClient | null } = { client: null };
+
     const onEvent = async (frame: GatewayEventFrame) => {
       if (frame.event !== "agent") {
         if (frame.event === "shutdown") {
@@ -1219,6 +1240,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             "stdout",
             `[openclaw-gateway] gateway shutdown notice: ${stringifyForLog(frame.payload ?? {}, 2_000)}\n`,
           );
+        }
+        // AC1–AC5: terminate_session handler (protocol v2 only)
+        if (frame.event === "terminate_session" && negotiatedFeatureProtocol >= 2) {
+          if (!pendingTermination) {
+            if (!jobInFlight) {
+              // AC1: immediate close — no job in-flight
+              await ctx.onLog("stdout", "[openclaw-gateway] terminate_session: no job in-flight, closing immediately (4001)\n");
+              terminatedByPauseSignal = true;
+              terminationRef.client?.closeWithCode(4001, "terminate_session");
+            } else {
+              // AC2: graceful drain — job in-flight, set flag and start timeout
+              pendingTermination = true;
+              await ctx.onLog(
+                "stdout",
+                `[openclaw-gateway] terminate_session: job in-flight, graceful drain started (timeout=${graceDrainTimeoutMs}ms)\n`,
+              );
+              // AC4: force-close after graceDrainTimeoutMs
+              drainTimer = setTimeout(() => {
+                if (terminationRef.client) {
+                  terminatedByPauseSignal = true;
+                  terminationRef.client.closeWithCode(4001, "terminate_session: drain timeout");
+                }
+                drainTimer = null;
+              }, graceDrainTimeoutMs);
+            }
+          }
+          // AC5: duplicate terminate_session frames are silently ignored (pendingTermination already true)
         }
         return;
       }
@@ -1333,13 +1381,50 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)} featureProtocol=${featureProtocolVersion}\n`,
       );
 
-      // Protocol v2 features (pause enforcement + bundle tracking) are gated here.
-      // NOR-4839 (terminate_session), NOR-4840 (bundle revision check),
-      // NOR-4841 (bundle_invalidated) will populate these branches.
+      // Capture negotiated feature protocol and client reference for terminate_session handler (NOR-4839).
+      negotiatedFeatureProtocol = featureProtocolVersion;
+      terminationRef.client = client;
+
       if (featureProtocolVersion >= 2) {
         await ctx.onLog("stdout", "[openclaw-gateway] feature protocol v2 active: pause enforcement + bundle tracking enabled\n");
       }
 
+      // AC6: statusCheckBeforeDispatch — defence-in-depth against paused agents dispatching new work
+      if (statusCheckBeforeDispatch && featureProtocolVersion >= 2 && paperclipStatusCheckUrl && ctx.agent.id) {
+        try {
+          const statusResp = await fetch(`${paperclipStatusCheckUrl}/api/agents/${ctx.agent.id}`, {
+            headers: ctx.authToken ? { Authorization: `Bearer ${ctx.authToken}` } : {},
+          });
+          if (statusResp.ok) {
+            const agentData = await statusResp.json() as Record<string, unknown>;
+            if (nonEmpty(agentData.status) === "paused") {
+              await ctx.onLog("stdout", "[openclaw-gateway] statusCheckBeforeDispatch: agent is paused, rejecting dispatch\n");
+              return {
+                exitCode: 1,
+                signal: null,
+                timedOut: false,
+                errorMessage: "Agent is paused; dispatch rejected by statusCheckBeforeDispatch",
+                errorCode: "openclaw_gateway_agent_paused",
+              };
+            }
+          }
+        } catch {
+          await ctx.onLog("stdout", "[openclaw-gateway] statusCheckBeforeDispatch: status check failed, continuing\n");
+        }
+      }
+
+      // AC3: reject dispatch if terminate_session was already received before job started
+      if (pendingTermination || terminatedByPauseSignal) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Session terminated by pause signal before dispatch",
+          errorCode: "openclaw_gateway_terminated",
+        };
+      }
+
+      jobInFlight = true; // mark job as in-flight before dispatch
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
       });
@@ -1415,6 +1500,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
 
+      // AC2: drain complete — job finished while pendingTermination was set
+      jobInFlight = false;
+      if (pendingTermination) {
+        if (drainTimer) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
+        terminatedByPauseSignal = true;
+        client.closeWithCode(4001, "terminate_session: drain complete");
+        await ctx.onLog("stdout", "[openclaw-gateway] terminate_session: graceful drain complete, closed with 4001\n");
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Session terminated by pause signal (graceful drain complete)",
+          errorCode: "openclaw_gateway_terminated",
+        };
+      }
+
       const summaryFromEvents = assistantChunks.join("").trim();
       const summaryFromPayload =
         extractResultText(asRecord(acceptedPayload?.result)) ??
@@ -1460,6 +1564,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(summary ? { summary } : {}),
       };
     } catch (err) {
+      // Clean termination by terminate_session: the closeWithCode(4001) call causes pending
+      // requests to fail — distinguish this from an unexpected network failure.
+      if (terminatedByPauseSignal) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Session terminated by pause signal",
+          errorCode: "openclaw_gateway_terminated",
+        };
+      }
+
       const message = err instanceof Error ? err.message : String(err);
       const lower = message.toLowerCase();
       const timedOut = lower.includes("timeout");
