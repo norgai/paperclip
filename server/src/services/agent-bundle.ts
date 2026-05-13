@@ -23,6 +23,7 @@ export type PersistedBundleRevision = {
   bundleRevisionId: string;
   bundleAssembledAt: Date;
   changed: boolean;
+  assembled: AssembledBundle;
 };
 
 /**
@@ -100,6 +101,7 @@ export async function persistBundleRevision(
       bundleRevisionId: row.bundleRevisionId,
       bundleAssembledAt: row.bundleAssembledAt,
       changed: false,
+      assembled,
     };
   }
 
@@ -116,5 +118,6 @@ export async function persistBundleRevision(
     bundleRevisionId: assembled.revisionId,
     bundleAssembledAt: now,
     changed: true,
+    assembled,
   };
 }
