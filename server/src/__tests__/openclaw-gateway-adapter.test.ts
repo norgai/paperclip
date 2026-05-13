@@ -490,6 +490,10 @@ describe("openclaw gateway adapter execute", () => {
       expect(payload).toBeTruthy();
       expect(payload?.idempotencyKey).toBe("run-123");
       expect(payload?.sessionKey).toBe("paperclip:issue:issue-123");
+      // NOR-4837 AC1+AC3+AC4: bundleRevisionId is present at top-level of every
+      // job dispatch; when the agent has no managed bundle it is sent as null.
+      expect(payload).toHaveProperty("bundleRevisionId");
+      expect(payload?.bundleRevisionId).toBeNull();
       expect(String(payload?.message ?? "")).toContain("wake now");
       expect(String(payload?.message ?? "")).toContain("PAPERCLIP_RUN_ID=run-123");
       expect(String(payload?.message ?? "")).toContain("PAPERCLIP_TASK_ID=task-123");

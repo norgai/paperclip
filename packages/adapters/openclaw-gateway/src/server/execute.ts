@@ -1125,11 +1125,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
   const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
 
+  // NOR-4837 AC1-AC4: Forward the agent's current managed-bundle revision id
+  // on every dispatch so the gateway can detect a stale bundle and reload
+  // before executing the job. Null when the agent has no managed bundle (AC3).
+  const bundleRevisionId =
+    typeof ctx.agent.bundleRevisionId === "string" && ctx.agent.bundleRevisionId.length > 0
+      ? ctx.agent.bundleRevisionId
+      : null;
+
   const agentParams: Record<string, unknown> = {
     ...payloadTemplate,
     message,
     sessionKey,
     idempotencyKey: ctx.runId,
+    bundleRevisionId,
   };
   delete agentParams.text;
   // agentParams.paperclip = paperclipPayload; // PATCHED: PR #626 fix

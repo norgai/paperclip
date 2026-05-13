@@ -8,6 +8,14 @@ export interface AdapterAgent {
   name: string;
   adapterType: string | null;
   adapterConfig: unknown;
+  /**
+   * Current managed-bundle revision id (sha256 hex) for this agent, or null
+   * if the agent has no managed instruction bundle. Populated by the paperclip
+   * server from `agents.bundleRevisionId` (NOR-4835). Adapters that dispatch
+   * remote work should forward this value so the receiver can detect a stale
+   * bundle and reload before executing (NOR-4837 Contract 2).
+   */
+  bundleRevisionId?: string | null;
 }
 
 export interface AdapterRuntime {
