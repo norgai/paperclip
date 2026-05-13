@@ -217,19 +217,6 @@ export function agentRoutes(db: Db) {
     return assertCanCreateAgentsForCompany(req, companyId);
   }
 
-  async function actorCanReadConfigurationsForCompany(req: Request, companyId: string) {
-    assertCompanyAccess(req, companyId);
-    if (req.actor.type === "board") {
-      if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) return true;
-      return access.canUser(companyId, req.actor.userId, "agents:create");
-    }
-    if (!req.actor.agentId) return false;
-    const actorAgent = await svc.getById(req.actor.agentId);
-    if (!actorAgent || actorAgent.companyId !== companyId) return false;
-    const allowedByGrant = await access.hasPermission(companyId, "agent", actorAgent.id, "agents:create");
-    return allowedByGrant || canCreateAgents(actorAgent);
-  }
-
   async function buildSkippedWakeupResponse(
     agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
     payload: Record<string, unknown> | null | undefined,
@@ -700,9 +687,18 @@ export function agentRoutes(db: Db) {
     if (!agent) return null;
     return {
       ...agent,
-      adapterConfig: {},
-      runtimeConfig: {},
+      adapterConfig:
+        redactEventPayload((agent.adapterConfig ?? null) as Record<string, unknown> | null) ?? {},
+      runtimeConfig:
+        redactEventPayload((agent.runtimeConfig ?? null) as Record<string, unknown> | null) ?? {},
     };
+  }
+
+  function actorIsAdminLike(req: Request): boolean {
+    return (
+      req.actor.type === "board" &&
+      (req.actor.source === "local_implicit" || Boolean(req.actor.isInstanceAdmin))
+    );
   }
 
   function redactAgentConfiguration(agent: Awaited<ReturnType<typeof svc.getById>>) {
@@ -965,12 +961,20 @@ export function agentRoutes(db: Db) {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const result = await svc.list(companyId);
-    const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
-    if (canReadConfigs || req.actor.type === "board") {
-      res.json(result);
-      return;
-    }
-    res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
+    // Raw adapter/runtime config is restricted to instance-admin-like board actors
+    // OR an agent inspecting its own row. All other callers (including board users
+    // with `agents:create` permission and non-self agents) receive a redacted view.
+    // Authorized configuration access (with structural redaction of secret values)
+    // is available via `/agents/:id/configuration`, gated by `assertCanReadConfigurations`.
+    const isAdmin = actorIsAdminLike(req);
+    const actorAgentId = req.actor.type === "agent" ? req.actor.agentId ?? null : null;
+    res.json(
+      result.map((agent) =>
+        isAdmin || (actorAgentId && actorAgentId === agent.id)
+          ? agent
+          : redactForRestrictedAgentView(agent),
+      ),
+    );
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {
@@ -1141,12 +1145,16 @@ export function agentRoutes(db: Db) {
       return;
     }
     assertCompanyAccess(req, agent.companyId);
-    if (req.actor.type === "agent" && req.actor.agentId !== id) {
-      const canRead = await actorCanReadConfigurationsForCompany(req, agent.companyId);
-      if (!canRead) {
-        res.json(await buildAgentDetail(agent, { restricted: true }));
-        return;
-      }
+    // Same gate as listing: raw adapter/runtime config requires instance-admin-like
+    // board actor OR self (agent inspecting its own record). Everyone else (board
+    // users with `agents:create`, non-self agents) sees a redacted view here.
+    // Configuration editing flows that need structured-but-redacted creds use
+    // `/agents/:id/configuration`.
+    const isAdmin = actorIsAdminLike(req);
+    const isSelf = req.actor.type === "agent" && req.actor.agentId === agent.id;
+    if (!isAdmin && !isSelf) {
+      res.json(await buildAgentDetail(agent, { restricted: true }));
+      return;
     }
     res.json(await buildAgentDetail(agent));
   });

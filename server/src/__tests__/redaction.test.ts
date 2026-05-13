@@ -63,4 +63,32 @@ describe("redaction", () => {
       safe: "value",
     });
   });
+
+  it("redacts bare token and CF-Access-Client-* keys (NOR-4845)", () => {
+    const input = {
+      headers: {
+        "x-openclaw-token": "wss-bearer-abc",
+        "X-Openclaw-Auth": "legacy-token",
+        "CF-Access-Client-Id": "cf-client-id-value",
+        "CF-Access-Client-Secret": "cf-client-secret-value",
+        token: "bare-token-value",
+        "content-type": "application/json",
+      },
+      devicePrivateKeyPem: "-----BEGIN PRIVATE KEY-----\nMIIE...\n-----END PRIVATE KEY-----\n",
+      safeField: "ok",
+    };
+
+    const result = sanitizeRecord(input);
+
+    expect(result.headers).toEqual({
+      "x-openclaw-token": REDACTED_EVENT_VALUE,
+      "X-Openclaw-Auth": REDACTED_EVENT_VALUE,
+      "CF-Access-Client-Id": REDACTED_EVENT_VALUE,
+      "CF-Access-Client-Secret": REDACTED_EVENT_VALUE,
+      token: REDACTED_EVENT_VALUE,
+      "content-type": "application/json",
+    });
+    expect(result.devicePrivateKeyPem).toBe(REDACTED_EVENT_VALUE);
+    expect(result.safeField).toBe("ok");
+  });
 });
