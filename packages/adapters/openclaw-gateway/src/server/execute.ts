@@ -86,6 +86,10 @@ type GatewayClientRequestOptions = {
 };
 
 const PROTOCOL_VERSION = 3;
+const GATEWAY_FEATURE_PROTOCOL_HEADER = "X-Paperclip-Gateway-Protocol";
+const GATEWAY_FEATURE_PROTOCOL_RESPONSE_HEADER = "sec-websocket-protocol"; // lowercase for Node.js headers
+const GATEWAY_FEATURE_PROTOCOL_ADVERTISED = "2,1"; // highest first
+const GATEWAY_FEATURE_PROTOCOL_DEFAULT = 1; // v1 when header absent or unparseable
 const DEFAULT_SCOPES = ["operator.admin"];
 const DEFAULT_CLIENT_ID = "gateway-client";
 const DEFAULT_CLIENT_MODE = "backend";
@@ -659,13 +663,28 @@ class GatewayWsClient {
   async connect(
     buildConnectParams: (nonce: string) => Record<string, unknown>,
     timeoutMs: number,
-  ): Promise<Record<string, unknown> | null> {
+  ): Promise<{ hello: Record<string, unknown> | null; featureProtocolVersion: number }> {
     this.ws = new WebSocket(this.opts.url, {
       headers: this.opts.headers,
       maxPayload: 25 * 1024 * 1024,
     });
 
     const ws = this.ws;
+    let featureProtocolVersion = GATEWAY_FEATURE_PROTOCOL_DEFAULT;
+
+    // Capture the negotiated gateway feature protocol version from the HTTP upgrade response.
+    // The gateway responds with Sec-WebSocket-Protocol set to the selected version number.
+    // If the header is absent (legacy gateway), we stay at the default (v1).
+    ws.on("upgrade", (response: { headers: Record<string, string | string[] | undefined> }) => {
+      const raw = response.headers[GATEWAY_FEATURE_PROTOCOL_RESPONSE_HEADER];
+      if (raw) {
+        const first = Array.isArray(raw) ? raw[0] : raw;
+        const parsed = parseInt(String(first ?? "").trim().split(",")[0].trim(), 10);
+        if (Number.isFinite(parsed) && parsed >= 1) {
+          featureProtocolVersion = parsed;
+        }
+      }
+    });
 
     ws.on("message", (data) => {
       this.handleMessage(rawDataToString(data));
@@ -717,7 +736,7 @@ class GatewayWsClient {
       timeoutMs,
     });
 
-    return hello;
+    return { hello, featureProtocolVersion };
   }
 
   async request<T>(
@@ -880,7 +899,7 @@ async function autoApproveDevicePairing(params: {
         },
       }),
       params.connectTimeoutMs,
-    );
+    ); // featureProtocolVersion not needed for pairing flow
 
     let requestId = params.requestId;
     if (!requestId) {
@@ -1091,6 +1110,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     headers.authorization = toAuthorizationHeaderValue(authToken);
   }
 
+  // Advertise supported gateway feature protocol versions on the WebSocket upgrade request.
+  // The gateway will respond with Sec-WebSocket-Protocol set to the selected version.
+  // Legacy gateways that don't respond will cause us to default to v1 (backwards-compatible).
+  if (!headerMapHasIgnoreCase(headers, GATEWAY_FEATURE_PROTOCOL_HEADER)) {
+    headers[GATEWAY_FEATURE_PROTOCOL_HEADER] = GATEWAY_FEATURE_PROTOCOL_ADVERTISED;
+  }
+
   const clientId = nonEmpty(ctx.config.clientId) ?? DEFAULT_CLIENT_ID;
   const clientMode = nonEmpty(ctx.config.clientMode) ?? DEFAULT_CLIENT_MODE;
   const clientVersion = nonEmpty(ctx.config.clientVersion) ?? DEFAULT_CLIENT_VERSION;
@@ -1254,7 +1280,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       await ctx.onLog("stdout", `[openclaw-gateway] connecting to ${parsedUrl.toString()}\n`);
 
-      const hello = await client.connect((nonce) => {
+      const { hello, featureProtocolVersion } = await client.connect((nonce) => {
         const signedAtMs = Date.now();
         const connectParams: Record<string, unknown> = {
           minProtocol: PROTOCOL_VERSION,
@@ -1304,8 +1330,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       await ctx.onLog(
         "stdout",
-        `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
+        `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)} featureProtocol=${featureProtocolVersion}\n`,
       );
+
+      // Protocol v2 features (pause enforcement + bundle tracking) are gated here.
+      // NOR-4839 (terminate_session), NOR-4840 (bundle revision check),
+      // NOR-4841 (bundle_invalidated) will populate these branches.
+      if (featureProtocolVersion >= 2) {
+        await ctx.onLog("stdout", "[openclaw-gateway] feature protocol v2 active: pause enforcement + bundle tracking enabled\n");
+      }
 
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
