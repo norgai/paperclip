@@ -61,6 +61,12 @@ type GatewayEventFrame = {
   seq?: number;
 };
 
+type GatewayAgentControlFrame = {
+  type: "agent_control";
+  action?: unknown;
+  [key: string]: unknown;
+};
+
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
@@ -77,6 +83,7 @@ type GatewayClientOptions = {
   url: string;
   headers: Record<string, string>;
   onEvent: (frame: GatewayEventFrame) => Promise<void> | void;
+  onAgentControl?: (frame: GatewayAgentControlFrame) => Promise<void> | void;
   onLog: AdapterExecutionContext["onLog"];
 };
 
@@ -641,6 +648,11 @@ function isEventFrame(value: unknown): value is GatewayEventFrame {
   return Boolean(record && record.type === "event" && typeof record.event === "string");
 }
 
+function isAgentControlFrame(value: unknown): value is GatewayAgentControlFrame {
+  const record = asRecord(value);
+  return Boolean(record && record.type === "agent_control");
+}
+
 class GatewayWsClient {
   private ws: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
@@ -805,6 +817,21 @@ class GatewayWsClient {
       void Promise.resolve(this.opts.onEvent(parsed)).catch(() => {
         // Ignore event callback failures and keep stream active.
       });
+      return;
+    }
+
+    // NOR-4837 Part 3 (AC10): inbound `agent_control` frames pushed by the
+    // gateway (e.g. `bundle_unavailable` when the gateway's bundle reload
+    // retries are exhausted). Forwarded to onAgentControl if registered;
+    // unhandled actions are silently ignored — the handler decides whether
+    // an unknown action is WARN-worthy. Persistence is offloaded behind a
+    // promise to keep the WS read loop non-blocking per spec.
+    if (isAgentControlFrame(parsed)) {
+      if (this.opts.onAgentControl) {
+        void Promise.resolve(this.opts.onAgentControl(parsed)).catch(() => {
+          // Ignore agent_control callback failures and keep stream active.
+        });
+      }
       return;
     }
 
@@ -1255,10 +1282,68 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     };
 
+    // NOR-4837 Part 3 (AC10-14): handle inbound `agent_control` frames pushed
+    // by the gateway. Currently only `bundle_unavailable` is recognized;
+    // unknown actions are logged at WARN level (AC12 — no silent drops).
+    // Persistence is offloaded to ctx.recordBundleUnavailable() so the WS
+    // read loop is never blocked by DB writes (spec: "must not block the
+    // WebSocket read loop").
+    const onAgentControl = async (frame: GatewayAgentControlFrame): Promise<void> => {
+      const action = nonEmpty(frame.action);
+      if (action !== "bundle_unavailable") {
+        await ctx.onLog(
+          "stdout",
+          `[openclaw-gateway] ignoring unknown agent_control action=${action ?? "<missing>"}\n`,
+        );
+        return;
+      }
+
+      const agentId = nonEmpty(frame.agentId);
+      const attemptedRevisionId = nonEmpty(frame.attemptedRevisionId);
+      const jobId = nonEmpty(frame.jobId);
+      const ts = nonEmpty(frame.ts);
+      const lastRetryError = nonEmpty(frame.lastRetryError);
+
+      // Required: agentId + attemptedRevisionId + jobId + ts. Missing any of
+      // these is malformed per AC12 — log WARN with raw payload, do not call
+      // ctx.recordBundleUnavailable (cannot dedupe without the triple).
+      if (!agentId || !attemptedRevisionId || !jobId || !ts) {
+        await ctx.onLog(
+          "stderr",
+          `[openclaw-gateway] WARN malformed bundle_unavailable frame (missing required fields): ${stringifyForLog(redactForLog(frame), 4_000)}\n`,
+        );
+        return;
+      }
+
+      if (!ctx.recordBundleUnavailable) {
+        await ctx.onLog(
+          "stdout",
+          "[openclaw-gateway] received bundle_unavailable but no recordBundleUnavailable handler is registered\n",
+        );
+        return;
+      }
+
+      try {
+        await ctx.recordBundleUnavailable({
+          agentId,
+          attemptedRevisionId,
+          jobId,
+          ts,
+          lastRetryError,
+        });
+      } catch (err) {
+        await ctx.onLog(
+          "stderr",
+          `[openclaw-gateway] recordBundleUnavailable failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    };
+
     const client = new GatewayWsClient({
       url: parsedUrl.toString(),
       headers,
       onEvent,
+      onAgentControl,
       onLog: ctx.onLog,
     });
 

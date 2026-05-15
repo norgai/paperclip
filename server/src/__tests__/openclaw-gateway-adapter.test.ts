@@ -41,6 +41,13 @@ function buildContext(
 
 async function createMockGatewayServer(options?: {
   waitPayload?: Record<string, unknown>;
+  /**
+   * Frames the mock gateway pushes to the connected adapter immediately
+   * after the `agent` request is accepted, before the `agent.wait` reply.
+   * Used by NOR-4837 Part 3 tests to deliver `agent_control` frames to the
+   * adapter during a live session.
+   */
+  injectAfterAgentAccept?: Array<Record<string, unknown>>;
 }) {
   const server = createServer();
   const wss = new WebSocketServer({ server });
@@ -138,6 +145,12 @@ async function createMockGatewayServer(options?: {
             },
           }),
         );
+
+        // NOR-4837 Part 3: deliver server-initiated agent_control frames
+        // to the live adapter session before the wait reply.
+        for (const inject of options?.injectAfterAgentAccept ?? []) {
+          socket.send(JSON.stringify(inject));
+        }
         return;
       }
 
@@ -628,6 +641,112 @@ describe("openclaw gateway adapter execute", () => {
         bundleRevisionId: "sha256-newrev",
         ts: "2026-05-15T00:00:00.000Z",
       });
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("persists bundle_unavailable agent_control frame via ctx.recordBundleUnavailable (NOR-4837 AC10–13)", async () => {
+    const gateway = await createMockGatewayServer({
+      injectAfterAgentAccept: [
+        {
+          type: "agent_control",
+          action: "bundle_unavailable",
+          agentId: "agent-123",
+          attemptedRevisionId: "rev-abc",
+          jobId: "job-xyz",
+          ts: "2026-05-15T08:00:00.000Z",
+          lastRetryError: "remote fetch failed",
+        },
+      ],
+    });
+
+    const recordCalls: Array<Record<string, unknown>> = [];
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: { "x-openclaw-token": "gateway-token" },
+            payloadTemplate: { message: "wake now" },
+            waitTimeoutMs: 2000,
+          },
+          {
+            recordBundleUnavailable: async (event) => {
+              recordCalls.push(event as unknown as Record<string, unknown>);
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(0);
+
+      // Allow the queued agent_control frame to drain through the WS loop.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(recordCalls).toHaveLength(1);
+      expect(recordCalls[0]).toEqual({
+        agentId: "agent-123",
+        attemptedRevisionId: "rev-abc",
+        jobId: "job-xyz",
+        ts: "2026-05-15T08:00:00.000Z",
+        lastRetryError: "remote fetch failed",
+      });
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("WARN-logs and skips persistence when bundle_unavailable frame is missing required fields (AC12)", async () => {
+    const gateway = await createMockGatewayServer({
+      injectAfterAgentAccept: [
+        {
+          type: "agent_control",
+          action: "bundle_unavailable",
+          agentId: "agent-123",
+          // attemptedRevisionId missing
+          jobId: "job-xyz",
+          ts: "2026-05-15T08:00:00.000Z",
+          lastRetryError: null,
+        },
+      ],
+    });
+
+    const recordCalls: Array<Record<string, unknown>> = [];
+    const logs: Array<{ stream: string; chunk: string }> = [];
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: { "x-openclaw-token": "gateway-token" },
+            payloadTemplate: { message: "wake now" },
+            waitTimeoutMs: 2000,
+          },
+          {
+            onLog: async (stream, chunk) => {
+              logs.push({ stream, chunk });
+            },
+            recordBundleUnavailable: async (event) => {
+              recordCalls.push(event as unknown as Record<string, unknown>);
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(recordCalls).toHaveLength(0);
+      expect(
+        logs.some(
+          (entry) =>
+            entry.stream === "stderr" &&
+            entry.chunk.includes("WARN malformed bundle_unavailable"),
+        ),
+      ).toBe(true);
     } finally {
       await gateway.close();
     }

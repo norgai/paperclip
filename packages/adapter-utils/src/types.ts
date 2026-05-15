@@ -153,6 +153,21 @@ export interface AdapterExecutionContext {
       ts: string;
     }) => void,
   ) => () => void;
+  /**
+   * Persist a `bundle_unavailable` control frame received from a gateway
+   * upstream (NOR-4837 Part 3, AC10–14). Adapters call this when the remote
+   * indicates the bundle could not be reloaded after exhausting retries.
+   * The handler is responsible for writing the activity_log row, updating
+   * runtime-state, and detecting `{agentId, jobId, attemptedRevisionId}`
+   * duplicates (AC14). Optional — adapters that don't need it can ignore it.
+   */
+  recordBundleUnavailable?: (event: {
+    agentId: string;
+    attemptedRevisionId: string;
+    jobId: string;
+    ts: string;
+    lastRetryError: string | null;
+  }) => Promise<void>;
 }
 
 export interface AdapterModel {

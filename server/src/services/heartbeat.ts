@@ -34,6 +34,7 @@ import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
 import { getAgentBundleWatcher } from "./agent-bundle-watcher.js";
+import { recordBundleUnavailable as recordBundleUnavailableFn } from "./bundle-unavailable.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { buildHeartbeatRunIssueComment, summarizeHeartbeatRunResultJson } from "./heartbeat-run-summary.js";
 import {
@@ -3526,6 +3527,16 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
         ? (agentId: string, handler: (evt: { agentId: string; bundleRevisionId: string; ts: string }) => void) =>
             bundleWatcher.subscribe(agentId, handler)
         : undefined;
+      // NOR-4837 Part 3: inbound bundle_unavailable persistence hook.
+      const recordBundleUnavailable = async (event: {
+        agentId: string;
+        attemptedRevisionId: string;
+        jobId: string;
+        ts: string;
+        lastRetryError: string | null;
+      }) => {
+        await recordBundleUnavailableFn(db, event);
+      };
       let adapterResult = await adapter.execute({
         runId: run.id,
         agent: gatewayDecision
@@ -3541,6 +3552,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
         },
         authToken: authToken ?? undefined,
         subscribeBundleInvalidated,
+        recordBundleUnavailable,
       });
 
       // Tooling handoff: if the heartbeat adapter signals it needs full tooling,
@@ -3569,6 +3581,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
             },
             authToken: primaryAuthToken ?? undefined,
             subscribeBundleInvalidated,
+            recordBundleUnavailable,
           });
           triageLog({ event: "tooling_handoff_complete", agentId: agent.id, agentName: agent.name, adapter: agent.adapterType, runId: run.id });
         }
