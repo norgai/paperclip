@@ -33,6 +33,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
+import { getAgentBundleWatcher } from "./agent-bundle-watcher.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { buildHeartbeatRunIssueComment, summarizeHeartbeatRunResultJson } from "./heartbeat-run-summary.js";
 import {
@@ -3517,6 +3518,14 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
         );
       }
       triageLog({ event: "adapter_execute", agentId: agent.id, agentName: agent.name, adapter: effectiveAdapterType, model: effectiveConfig.model ?? "default", runId: run.id });
+      // NOR-4837 Part 2: surface the bundle-watcher subscription to adapters
+      // that hold a long-lived remote connection (e.g. openclaw-gateway).
+      // Optional — adapters that don't need it can ignore the callback.
+      const bundleWatcher = getAgentBundleWatcher();
+      const subscribeBundleInvalidated = bundleWatcher
+        ? (agentId: string, handler: (evt: { agentId: string; bundleRevisionId: string; ts: string }) => void) =>
+            bundleWatcher.subscribe(agentId, handler)
+        : undefined;
       let adapterResult = await adapter.execute({
         runId: run.id,
         agent: gatewayDecision
@@ -3531,6 +3540,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
           await persistRunProcessMetadata(run.id, meta);
         },
         authToken: authToken ?? undefined,
+        subscribeBundleInvalidated,
       });
 
       // Tooling handoff: if the heartbeat adapter signals it needs full tooling,
@@ -3558,6 +3568,7 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
               await persistRunProcessMetadata(run.id, meta);
             },
             authToken: primaryAuthToken ?? undefined,
+            subscribeBundleInvalidated,
           });
           triageLog({ event: "tooling_handoff_complete", agentId: agent.id, agentName: agent.name, adapter: agent.adapterType, runId: run.id });
         }

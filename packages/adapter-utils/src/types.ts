@@ -137,6 +137,22 @@ export interface AdapterExecutionContext {
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onSpawn?: (meta: { pid: number; startedAt: string }) => Promise<void>;
   authToken?: string;
+  /**
+   * Subscribe to bundle_invalidated events for the given agent (NOR-4837
+   * Part 2, AC5–9). Adapters that hold a long-lived connection to a remote
+   * runner (e.g. openclaw-gateway) should subscribe for the lifetime of
+   * their session and forward each event so the remote can reload the
+   * managed instructions bundle before the next job. Returns an unsubscribe
+   * function. Optional — adapters that don't need it can ignore it.
+   */
+  subscribeBundleInvalidated?: (
+    agentId: string,
+    handler: (event: {
+      agentId: string;
+      bundleRevisionId: string;
+      ts: string;
+    }) => void,
+  ) => () => void;
 }
 
 export interface AdapterModel {

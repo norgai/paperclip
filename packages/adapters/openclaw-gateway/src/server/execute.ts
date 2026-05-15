@@ -759,6 +759,18 @@ class GatewayWsClient {
     return requestPromise;
   }
 
+  /**
+   * Send a top-level `agent_control` frame to the gateway (fire-and-forget,
+   * no response correlation). Used to push proactive control notices such as
+   * `bundle_invalidated` (NOR-4837 Part 2, AC6). The frame shape matches the
+   * spec verbatim: a top-level message with `type: "agent_control"` and an
+   * `action` field, not nested inside a `req`.
+   */
+  sendAgentControl(frame: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "agent_control", ...frame }));
+  }
+
   close() {
     if (!this.ws) return;
     this.ws.close(1000, "paperclip-complete");
@@ -1250,6 +1262,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       onLog: ctx.onLog,
     });
 
+    // NOR-4837 Part 2 (AC5–9): forward bundle_invalidated events to the
+    // gateway for the lifetime of the WebSocket session. The subscription
+    // is registered AFTER `client.connect` succeeds (so AC7 — "only push if
+    // agent has an active gateway WebSocket connection" — is satisfied by
+    // the subscription window itself) and torn down in `finally` before
+    // `client.close()`.
+    let unsubscribeBundleInvalidated: (() => void) | null = null;
+
     try {
       deviceIdentity = disableDeviceAuth ? null : resolveDeviceIdentity(parseObject(ctx.config));
       if (deviceIdentity) {
@@ -1315,6 +1335,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
       );
+
+      // NOR-4837 Part 2 (AC5–9): start forwarding bundle_invalidated events
+      // now that the WS is open. Frames are emitted by the server-side
+      // bundle watcher (debounced 500ms per AC9, AFTER the new revision is
+      // persisted per AC8) and forwarded as top-level `agent_control` frames
+      // per AC6.
+      if (ctx.subscribeBundleInvalidated) {
+        unsubscribeBundleInvalidated = ctx.subscribeBundleInvalidated(
+          ctx.agent.id,
+          (evt) => {
+            client.sendAgentControl({
+              action: "bundle_invalidated",
+              bundleRevisionId: evt.bundleRevisionId,
+              agentId: evt.agentId,
+              ts: evt.ts,
+            });
+          },
+        );
+      }
 
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
@@ -1496,6 +1535,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: asRecord(latestResultPayload),
       };
     } finally {
+      if (unsubscribeBundleInvalidated) {
+        try {
+          unsubscribeBundleInvalidated();
+        } catch {
+          // best-effort cleanup; never block close on a stray listener error
+        }
+        unsubscribeBundleInvalidated = null;
+      }
       client.close();
     }
   }

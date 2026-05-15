@@ -46,6 +46,7 @@ async function createMockGatewayServer(options?: {
   const wss = new WebSocketServer({ server });
 
   let agentPayload: Record<string, unknown> | null = null;
+  const agentControlFrames: Record<string, unknown>[] = [];
 
   wss.on("connection", (socket) => {
     socket.send(
@@ -64,6 +65,11 @@ async function createMockGatewayServer(options?: {
         method: string;
         params?: Record<string, unknown>;
       };
+
+      if (frame.type === "agent_control") {
+        agentControlFrames.push(frame as unknown as Record<string, unknown>);
+        return;
+      }
 
       if (frame.type !== "req") return;
 
@@ -165,6 +171,7 @@ async function createMockGatewayServer(options?: {
   return {
     url: `ws://127.0.0.1:${address.port}`,
     getAgentPayload: () => agentPayload,
+    getAgentControlFrames: () => agentControlFrames.slice(),
     close: async () => {
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -568,6 +575,59 @@ describe("openclaw gateway adapter execute", () => {
           status: "running",
         }),
       ]);
+    } finally {
+      await gateway.close();
+    }
+  });
+
+  it("forwards bundle_invalidated as a top-level agent_control frame (NOR-4837 AC6)", async () => {
+    const gateway = await createMockGatewayServer();
+    const logs: string[] = [];
+
+    try {
+      const result = await execute(
+        buildContext(
+          {
+            url: gateway.url,
+            headers: { "x-openclaw-token": "gateway-token" },
+            payloadTemplate: { message: "wake now" },
+            waitTimeoutMs: 2000,
+          },
+          {
+            onLog: async (_stream, chunk) => {
+              logs.push(chunk);
+            },
+            // Fire a bundle_invalidated event synchronously the moment the
+            // adapter subscribes (which happens right after WS connect but
+            // before the `agent` request). This deterministically forces the
+            // adapter to send an agent_control frame during the live session.
+            subscribeBundleInvalidated: (agentId, handler) => {
+              handler({
+                agentId,
+                bundleRevisionId: "sha256-newrev",
+                ts: "2026-05-15T00:00:00.000Z",
+              });
+              return () => {};
+            },
+          },
+        ),
+      );
+
+      expect(result.exitCode).toBe(0);
+
+      // Give the mock server a microtask cycle to ingest the queued
+      // agent_control frame written immediately after `client.connect()`.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      const frames = gateway.getAgentControlFrames();
+      expect(frames).toHaveLength(1);
+      expect(frames[0]).toMatchObject({
+        type: "agent_control",
+        action: "bundle_invalidated",
+        agentId: "agent-123",
+        bundleRevisionId: "sha256-newrev",
+        ts: "2026-05-15T00:00:00.000Z",
+      });
     } finally {
       await gateway.close();
     }

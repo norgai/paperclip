@@ -46,6 +46,12 @@ import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
+import {
+  createAgentBundleWatcher,
+  setAgentBundleWatcher,
+} from "./services/agent-bundle-watcher.js";
+import { getAgentBundleRootPath } from "./services/agent-instructions.js";
+import { agents } from "@paperclipai/db";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
@@ -327,6 +333,37 @@ export async function createApp(
       async (pluginId) => (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
     )
     : null;
+
+  // NOR-4837 Part 2: start the managed-bundle file watcher and register it
+  // as the singleton consumed by `heartbeat.ts` when threading
+  // `subscribeBundleInvalidated` into adapter execution contexts. Initial
+  // scan: walk every agent with a resolvable bundle root and start watching.
+  // Agents created after boot are NOT auto-watched in v1 — server restart
+  // picks them up. Acceptable per the spec, which only requires "file system
+  // events, not polling" and a manual test against the current agent set.
+  const agentBundleWatcher = createAgentBundleWatcher(db);
+  setAgentBundleWatcher(agentBundleWatcher);
+  void (async () => {
+    try {
+      const rows = await db
+        .select({
+          id: agents.id,
+          companyId: agents.companyId,
+          name: agents.name,
+          adapterConfig: agents.adapterConfig,
+        })
+        .from(agents);
+      for (const row of rows) {
+        const rootPath = getAgentBundleRootPath(row);
+        if (rootPath) agentBundleWatcher.watchAgent(row.id, rootPath);
+      }
+    } catch (err) {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        "agent-bundle-watcher: initial scan failed",
+      );
+    }
+  })();
   void loader.loadAll().then((result) => {
     if (!result) return;
     for (const loaded of result.results) {
@@ -340,6 +377,8 @@ export async function createApp(
   process.once("exit", () => {
     if (feedbackExportTimer) clearInterval(feedbackExportTimer);
     devWatcher?.close();
+    void agentBundleWatcher.close();
+    setAgentBundleWatcher(null);
     hostServiceCleanup.disposeAll();
     hostServiceCleanup.teardown();
   });
