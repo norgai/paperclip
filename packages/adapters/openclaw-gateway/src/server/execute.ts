@@ -14,6 +14,142 @@ import {
 import crypto, { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 
+// NOR-4840: Process-level bundle cache keyed by agentId.
+// Exported for test isolation only — do not use outside tests.
+export function _clearBundleCacheForTest(): void {
+  bundleCache.clear();
+}
+
+
+// Persists across execute() calls within the same process so that consecutive
+// heartbeats with an unchanged bundleRevisionId incur zero reload overhead (AC3).
+type BundleCacheEntry = {
+  revisionId: string;
+  text: string;
+};
+const bundleCache = new Map<string, BundleCacheEntry>();
+
+type BundleLoadSuccess = { ok: true; revisionId: string; text: string };
+type BundleLoadFailure = { ok: false; lastError: string };
+type BundleLoadResult = BundleLoadSuccess | BundleLoadFailure;
+
+// Default retry delays (ms): 2s, 8s, 32s — exponential backoff per AC9.
+const DEFAULT_BUNDLE_RELOAD_RETRY_DELAYS_MS = [2_000, 8_000, 32_000];
+
+export function parseBundleReloadRetryDelays(value: unknown): number[] {
+  if (Array.isArray(value)) {
+    const parsed = value
+      .map((entry) => (typeof entry === "number" && Number.isFinite(entry) && entry > 0 ? Math.floor(entry) : null))
+      .filter((entry): entry is number => entry !== null);
+    if (parsed.length > 0) return parsed;
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = value
+      .split(",")
+      .map((entry) => parseInt(entry.trim(), 10))
+      .filter((entry) => Number.isFinite(entry) && entry > 0);
+    if (parsed.length > 0) return parsed;
+  }
+  return DEFAULT_BUNDLE_RELOAD_RETRY_DELAYS_MS;
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchBundle(
+  agentId: string,
+  paperclipUrl: string,
+  authToken: string | undefined,
+): Promise<BundleLoadSuccess | null> {
+  const url = `${paperclipUrl}/api/agents/${agentId}/bundle`;
+  const headers: Record<string, string> = {};
+  if (authToken) headers["Authorization"] = `Bearer ${authToken}`;
+
+  const resp = await fetch(url, { headers });
+  if (!resp.ok) {
+    throw new Error(`GET /api/agents/${agentId}/bundle returned HTTP ${resp.status}`);
+  }
+  const body = await resp.json() as Record<string, unknown>;
+  const revisionId = typeof body.bundleRevisionId === "string" ? body.bundleRevisionId : null;
+  const text = typeof body.text === "string" ? body.text : "";
+  if (!revisionId) {
+    throw new Error(`GET /api/agents/${agentId}/bundle returned no bundleRevisionId`);
+  }
+  return { ok: true, revisionId, text };
+}
+
+async function loadBundleWithRetry(
+  agentId: string,
+  paperclipUrl: string,
+  authToken: string | undefined,
+  retryDelaysMs: number[],
+  onLog: AdapterExecutionContext["onLog"],
+): Promise<BundleLoadResult> {
+  let lastError = "bundle reload failed";
+  // retryDelaysMs.length is the number of inter-attempt delays → attempts = delays + 1
+  const maxAttempts = retryDelaysMs.length + 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const result = await fetchBundle(agentId, paperclipUrl, authToken);
+      if (result) {
+        await onLog("stdout", `[openclaw-gateway] bundle reload succeeded attempt=${attempt}/${maxAttempts} revision=${result.revisionId}\n`);
+        return result;
+      }
+    } catch (err) {
+      lastError = (err instanceof Error ? err.message : String(err)).slice(0, 500);
+      const remaining = maxAttempts - attempt;
+      if (remaining > 0) {
+        const delayMs = retryDelaysMs[attempt - 1];
+        await onLog("stdout", `[openclaw-gateway] bundle reload attempt=${attempt}/${maxAttempts} failed (${lastError}); retrying in ${delayMs}ms\n`);
+        await sleep(delayMs);
+      } else {
+        await onLog("stdout", `[openclaw-gateway] bundle reload exhausted after ${maxAttempts} attempts; lastError=${lastError}\n`);
+      }
+    }
+  }
+  return { ok: false, lastError };
+}
+
+async function pushBundleUnavailableFrame(
+  ctx: AdapterExecutionContext,
+  paperclipUrl: string,
+  attemptedRevisionId: string,
+  lastRetryError: string,
+  jobId: string,
+): Promise<void> {
+  // AC12: Push dedicated agent_control/bundle_unavailable control frame to Paperclip.
+  // Paperclip-side handling is implemented in NOR-4837 Part 3.
+  const frame = {
+    type: "agent_control",
+    action: "bundle_unavailable",
+    agentId: ctx.agent.id,
+    attemptedRevisionId,
+    lastRetryError: lastRetryError.slice(0, 500),
+    jobId,
+    ts: new Date().toISOString(),
+  };
+  const url = `${paperclipUrl}/api/companies/${ctx.agent.companyId}/agent-control-events`;
+  try {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ctx.authToken) headers["Authorization"] = `Bearer ${ctx.authToken}`;
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(frame),
+    });
+    await ctx.onLog(
+      "stdout",
+      `[openclaw-gateway] bundle_unavailable frame pushed status=${resp.status} agentId=${ctx.agent.id} jobId=${jobId}\n`,
+    );
+  } catch (err) {
+    // AC14: Never silently drop — log the push failure but do not swallow the bundle_unavailable error.
+    const msg = err instanceof Error ? err.message : String(err);
+    await ctx.onLog("stderr", `[openclaw-gateway] failed to push bundle_unavailable frame: ${msg}\n`);
+  }
+}
+
 type SessionKeyStrategy = "fixed" | "issue" | "run";
 
 type WakePayload = {
@@ -784,6 +920,12 @@ class GatewayWsClient {
     this.ws = null;
   }
 
+  closeWithCode(code: number, reason: string) {
+    if (!this.ws) return;
+    this.ws.close(code, reason);
+    this.ws = null;
+  }
+
   private failPending(err: Error) {
     for (const [, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);
@@ -1098,6 +1240,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const connectTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, 15_000) : 10_000;
   const waitTimeoutMs = parseOptionalPositiveInteger(ctx.config.waitTimeoutMs) ?? (timeoutMs > 0 ? timeoutMs : 30_000);
 
+  // Protocol v2 pause-enforcement config (AC7)
+  const graceDrainTimeoutMs = parseOptionalPositiveInteger(ctx.config.graceDrainTimeoutMs) ?? 300_000;
+  const statusCheckBeforeDispatch = parseBoolean(ctx.config.statusCheckBeforeDispatch, true);
+  const paperclipStatusCheckUrl =
+    resolvePaperclipApiUrlOverride(ctx.config.paperclipApiUrl) ??
+    (typeof process !== "undefined" ? (process.env.PAPERCLIP_API_URL ?? null) : null);
+
   const payloadTemplate = parseObject(ctx.config.payloadTemplate);
   const transportHint = nonEmpty(ctx.config.streamTransport) ?? nonEmpty(ctx.config.transport);
 
@@ -1202,6 +1351,74 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     );
   }
 
+  // -------------------------------------------------------------------------
+  // NOR-4840: Bundle revision check and reload on mismatch (AC1–AC14)
+  // -------------------------------------------------------------------------
+  // AC1: Extract bundleRevisionId from job dispatch context (added by NOR-4837 Part 1).
+  const dispatchedRevisionId = nonEmpty(ctx.context.bundleRevisionId);
+  const bundleReloadRetryDelays = parseBundleReloadRetryDelays(ctx.config.bundleReloadRetryDelaysMs);
+
+  if (dispatchedRevisionId !== null) {
+    // AC5 negation: bundleRevisionId is non-null → managed bundle, check required.
+    // AC2: Compare received revision against cached revision.
+    const cached = bundleCache.get(ctx.agent.id);
+    if (!cached || cached.revisionId !== dispatchedRevisionId) {
+      // AC4: Mismatch (or no cache) → trigger bundle reload.
+      await ctx.onLog(
+        "stdout",
+        `[openclaw-gateway] bundle revision mismatch: cached=${cached?.revisionId ?? "none"} dispatched=${dispatchedRevisionId}; reloading\n`,
+      );
+
+      if (!paperclipStatusCheckUrl) {
+        await ctx.onLog("stderr", "[openclaw-gateway] bundle reload required but paperclipApiUrl not set; skipping reload\n");
+      } else {
+        // AC6/AC9: Reload with retry (up to 3 attempts: delays [2s, 8s, 32s] by default).
+        const reloadResult = await loadBundleWithRetry(
+          ctx.agent.id,
+          paperclipStatusCheckUrl,
+          ctx.authToken,
+          bundleReloadRetryDelays,
+          ctx.onLog,
+        );
+
+        if (reloadResult.ok) {
+          // AC7: Update cache with fresh revision and content.
+          bundleCache.set(ctx.agent.id, { revisionId: reloadResult.revisionId, text: reloadResult.text });
+          await ctx.onLog(
+            "stdout",
+            `[openclaw-gateway] bundle cache updated revision=${reloadResult.revisionId}\n`,
+          );
+          // AC8: Proceed with job execution using fresh instructions (fall through to dispatch).
+        } else {
+          // AC10: Retry exhaustion → reject job, keep WebSocket closed (never opened yet).
+          // AC12: Push agent_control/bundle_unavailable frame to Paperclip.
+          await pushBundleUnavailableFrame(
+            ctx,
+            paperclipStatusCheckUrl,
+            dispatchedRevisionId,
+            reloadResult.lastError,
+            ctx.runId,
+          );
+          // AC14: No silent drops — error returned to Paperclip run.
+          return {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            errorMessage: `Bundle reload failed after ${bundleReloadRetryDelays.length + 1} attempts: ${reloadResult.lastError}`,
+            errorCode: "openclaw_gateway_bundle_unavailable",
+          };
+        }
+      }
+    } else {
+      // AC3: Revision matches cache → proceed immediately (zero additional latency).
+      await ctx.onLog("stdout", `[openclaw-gateway] bundle revision match: ${dispatchedRevisionId}; no reload needed\n`);
+    }
+  } else {
+    // AC5: bundleRevisionId is null → non-managed agent, skip revision check.
+    await ctx.onLog("stdout", "[openclaw-gateway] bundleRevisionId is null; skipping bundle revision check\n");
+  }
+  // -------------------------------------------------------------------------
+
   const autoPairOnFirstConnect = parseBoolean(ctx.config.autoPairOnFirstConnect, true);
   let autoPairAttempted = false;
   let latestResultPayload: unknown = null;
@@ -1212,6 +1429,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let lifecycleError: string | null = null;
     let deviceIdentity: GatewayDeviceIdentity | null = null;
 
+    // Protocol v2 pause-enforcement session state (NOR-4839)
+    let terminatedByPauseSignal = false;
+    let jobInFlight = false;
+    let pendingTermination = false;
+    let drainTimer: ReturnType<typeof setTimeout> | null = null;
+    let negotiatedFeatureProtocol = GATEWAY_FEATURE_PROTOCOL_DEFAULT;
+    const terminationRef: { client: GatewayWsClient | null } = { client: null };
+
     const onEvent = async (frame: GatewayEventFrame) => {
       if (frame.event !== "agent") {
         if (frame.event === "shutdown") {
@@ -1219,6 +1444,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             "stdout",
             `[openclaw-gateway] gateway shutdown notice: ${stringifyForLog(frame.payload ?? {}, 2_000)}\n`,
           );
+        }
+        // AC1–AC5: terminate_session handler (protocol v2 only)
+        if (frame.event === "terminate_session" && negotiatedFeatureProtocol >= 2) {
+          if (!pendingTermination) {
+            if (!jobInFlight) {
+              // AC1: immediate close — no job in-flight
+              await ctx.onLog("stdout", "[openclaw-gateway] terminate_session: no job in-flight, closing immediately (4001)\n");
+              terminatedByPauseSignal = true;
+              terminationRef.client?.closeWithCode(4001, "terminate_session");
+            } else {
+              // AC2: graceful drain — job in-flight, set flag and start timeout
+              pendingTermination = true;
+              await ctx.onLog(
+                "stdout",
+                `[openclaw-gateway] terminate_session: job in-flight, graceful drain started (timeout=${graceDrainTimeoutMs}ms)\n`,
+              );
+              // AC4: force-close after graceDrainTimeoutMs
+              drainTimer = setTimeout(() => {
+                if (terminationRef.client) {
+                  terminatedByPauseSignal = true;
+                  terminationRef.client.closeWithCode(4001, "terminate_session: drain timeout");
+                }
+                drainTimer = null;
+              }, graceDrainTimeoutMs);
+            }
+          }
+          // AC5: duplicate terminate_session frames are silently ignored (pendingTermination already true)
         }
         return;
       }
@@ -1333,13 +1585,50 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)} featureProtocol=${featureProtocolVersion}\n`,
       );
 
-      // Protocol v2 features (pause enforcement + bundle tracking) are gated here.
-      // NOR-4839 (terminate_session), NOR-4840 (bundle revision check),
-      // NOR-4841 (bundle_invalidated) will populate these branches.
+      // Capture negotiated feature protocol and client reference for terminate_session handler (NOR-4839).
+      negotiatedFeatureProtocol = featureProtocolVersion;
+      terminationRef.client = client;
+
       if (featureProtocolVersion >= 2) {
         await ctx.onLog("stdout", "[openclaw-gateway] feature protocol v2 active: pause enforcement + bundle tracking enabled\n");
       }
 
+      // AC6: statusCheckBeforeDispatch — defence-in-depth against paused agents dispatching new work
+      if (statusCheckBeforeDispatch && featureProtocolVersion >= 2 && paperclipStatusCheckUrl && ctx.agent.id) {
+        try {
+          const statusResp = await fetch(`${paperclipStatusCheckUrl}/api/agents/${ctx.agent.id}`, {
+            headers: ctx.authToken ? { Authorization: `Bearer ${ctx.authToken}` } : {},
+          });
+          if (statusResp.ok) {
+            const agentData = await statusResp.json() as Record<string, unknown>;
+            if (nonEmpty(agentData.status) === "paused") {
+              await ctx.onLog("stdout", "[openclaw-gateway] statusCheckBeforeDispatch: agent is paused, rejecting dispatch\n");
+              return {
+                exitCode: 1,
+                signal: null,
+                timedOut: false,
+                errorMessage: "Agent is paused; dispatch rejected by statusCheckBeforeDispatch",
+                errorCode: "openclaw_gateway_agent_paused",
+              };
+            }
+          }
+        } catch {
+          await ctx.onLog("stdout", "[openclaw-gateway] statusCheckBeforeDispatch: status check failed, continuing\n");
+        }
+      }
+
+      // AC3: reject dispatch if terminate_session was already received before job started
+      if (pendingTermination || terminatedByPauseSignal) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Session terminated by pause signal before dispatch",
+          errorCode: "openclaw_gateway_terminated",
+        };
+      }
+
+      jobInFlight = true; // mark job as in-flight before dispatch
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
       });
@@ -1415,6 +1704,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
       }
 
+      // AC2: drain complete — job finished while pendingTermination was set
+      jobInFlight = false;
+      if (pendingTermination) {
+        if (drainTimer) {
+          clearTimeout(drainTimer);
+          drainTimer = null;
+        }
+        terminatedByPauseSignal = true;
+        client.closeWithCode(4001, "terminate_session: drain complete");
+        await ctx.onLog("stdout", "[openclaw-gateway] terminate_session: graceful drain complete, closed with 4001\n");
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Session terminated by pause signal (graceful drain complete)",
+          errorCode: "openclaw_gateway_terminated",
+        };
+      }
+
       const summaryFromEvents = assistantChunks.join("").trim();
       const summaryFromPayload =
         extractResultText(asRecord(acceptedPayload?.result)) ??
@@ -1460,6 +1768,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(summary ? { summary } : {}),
       };
     } catch (err) {
+      // Clean termination by terminate_session: the closeWithCode(4001) call causes pending
+      // requests to fail — distinguish this from an unexpected network failure.
+      if (terminatedByPauseSignal) {
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: "Session terminated by pause signal",
+          errorCode: "openclaw_gateway_terminated",
+        };
+      }
+
       const message = err instanceof Error ? err.message : String(err);
       const lower = message.toLowerCase();
       const timedOut = lower.includes("timeout");
