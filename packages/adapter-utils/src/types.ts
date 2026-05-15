@@ -11,6 +11,14 @@ export interface AdapterAgent {
   name: string;
   adapterType: string | null;
   adapterConfig: unknown;
+  /**
+   * Current managed-bundle revision id (sha256 hex) for this agent, or null
+   * if the agent has no managed instruction bundle. Populated by the paperclip
+   * server from `agents.bundleRevisionId` (NOR-4835). Adapters that dispatch
+   * remote work should forward this value so the receiver can detect a stale
+   * bundle and reload before executing (NOR-4837 Contract 2).
+   */
+  bundleRevisionId?: string | null;
 }
 
 export interface AdapterRuntime {
@@ -145,6 +153,37 @@ export interface AdapterExecutionContext {
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   authToken?: string;
+  /**
+   * Subscribe to bundle_invalidated events for the given agent (NOR-4837
+   * Part 2, AC5–9). Adapters that hold a long-lived connection to a remote
+   * runner (e.g. openclaw-gateway) should subscribe for the lifetime of
+   * their session and forward each event so the remote can reload the
+   * managed instructions bundle before the next job. Returns an unsubscribe
+   * function. Optional — adapters that don't need it can ignore it.
+   */
+  subscribeBundleInvalidated?: (
+    agentId: string,
+    handler: (event: {
+      agentId: string;
+      bundleRevisionId: string;
+      ts: string;
+    }) => void,
+  ) => () => void;
+  /**
+   * Persist a `bundle_unavailable` control frame received from a gateway
+   * upstream (NOR-4837 Part 3, AC10–14). Adapters call this when the remote
+   * indicates the bundle could not be reloaded after exhausting retries.
+   * The handler is responsible for writing the activity_log row, updating
+   * runtime-state, and detecting `{agentId, jobId, attemptedRevisionId}`
+   * duplicates (AC14). Optional — adapters that don't need it can ignore it.
+   */
+  recordBundleUnavailable?: (event: {
+    agentId: string;
+    attemptedRevisionId: string;
+    jobId: string;
+    ts: string;
+    lastRetryError: string | null;
+  }) => Promise<void>;
 }
 
 export interface AdapterModel {

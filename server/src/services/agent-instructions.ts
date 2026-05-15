@@ -429,6 +429,16 @@ async function writeBundleFiles(
   }
 }
 
+/**
+ * Resolve the on-disk root path of an agent's instructions bundle, or `null`
+ * if the agent has no resolvable bundle yet. Exposed so the bundle file
+ * watcher (NOR-4837 Part 2) can enumerate watch targets at server boot
+ * without re-implementing the bundle-state derivation rules.
+ */
+export function getAgentBundleRootPath(agent: AgentLike): string | null {
+  return deriveBundleState(agent).rootPath;
+}
+
 export function syncInstructionsBundleConfigFromFilePath(
   agent: AgentLike,
   adapterConfig: Record<string, unknown>,

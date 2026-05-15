@@ -67,6 +67,8 @@ import { getTelemetryClient } from "../telemetry.js";
 import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService } from "./secrets.js";
+import { getAgentBundleWatcher } from "./agent-bundle-watcher.js";
+import { recordBundleUnavailable as recordBundleUnavailableFn } from "./bundle-unavailable.js";
 import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import {
   buildHeartbeatRunIssueComment,
@@ -8127,6 +8129,24 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
         );
       }
       triageLog({ event: "adapter_execute", agentId: agent.id, agentName: agent.name, adapter: effectiveAdapterType, model: effectiveConfig.model ?? "default", runId: run.id });
+      // NOR-4837 Part 2: surface the bundle-watcher subscription to adapters
+      // that hold a long-lived remote connection (e.g. openclaw-gateway).
+      // Optional — adapters that don't need it can ignore the callback.
+      const bundleWatcher = getAgentBundleWatcher();
+      const subscribeBundleInvalidated = bundleWatcher
+        ? (agentId: string, handler: (evt: { agentId: string; bundleRevisionId: string; ts: string }) => void) =>
+            bundleWatcher.subscribe(agentId, handler)
+        : undefined;
+      // NOR-4837 Part 3: inbound bundle_unavailable persistence hook.
+      const recordBundleUnavailable = async (event: {
+        agentId: string;
+        attemptedRevisionId: string;
+        jobId: string;
+        ts: string;
+        lastRetryError: string | null;
+      }) => {
+        await recordBundleUnavailableFn(db, event);
+      };
       let adapterResult = await adapter.execute({
         runId: run.id,
         agent: gatewayDecision
@@ -8153,6 +8173,8 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
           });
         },
         authToken: authToken ?? undefined,
+        subscribeBundleInvalidated,
+        recordBundleUnavailable,
       });
 
       // Tooling handoff: if the heartbeat adapter signals it needs full tooling,
@@ -8180,6 +8202,8 @@ Respond with exactly one word: SKIP, ROUTINE, or COMPLEX`;
               await persistRunProcessMetadata(run.id, meta);
             },
             authToken: primaryAuthToken ?? undefined,
+            subscribeBundleInvalidated,
+            recordBundleUnavailable,
           });
           triageLog({ event: "tooling_handoff_complete", agentId: agent.id, agentName: agent.name, adapter: agent.adapterType, runId: run.id });
         }

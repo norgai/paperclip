@@ -62,6 +62,12 @@ type GatewayEventFrame = {
   seq?: number;
 };
 
+type GatewayAgentControlFrame = {
+  type: "agent_control";
+  action?: unknown;
+  [key: string]: unknown;
+};
+
 type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (err: Error) => void;
@@ -78,6 +84,7 @@ type GatewayClientOptions = {
   url: string;
   headers: Record<string, string>;
   onEvent: (frame: GatewayEventFrame) => Promise<void> | void;
+  onAgentControl?: (frame: GatewayAgentControlFrame) => Promise<void> | void;
   onLog: AdapterExecutionContext["onLog"];
 };
 
@@ -648,6 +655,11 @@ function isEventFrame(value: unknown): value is GatewayEventFrame {
   return Boolean(record && record.type === "event" && typeof record.event === "string");
 }
 
+function isAgentControlFrame(value: unknown): value is GatewayAgentControlFrame {
+  const record = asRecord(value);
+  return Boolean(record && record.type === "agent_control");
+}
+
 class GatewayWsClient {
   private ws: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
@@ -766,6 +778,18 @@ class GatewayWsClient {
     return requestPromise;
   }
 
+  /**
+   * Send a top-level `agent_control` frame to the gateway (fire-and-forget,
+   * no response correlation). Used to push proactive control notices such as
+   * `bundle_invalidated` (NOR-4837 Part 2, AC6). The frame shape matches the
+   * spec verbatim: a top-level message with `type: "agent_control"` and an
+   * `action` field, not nested inside a `req`.
+   */
+  sendAgentControl(frame: Record<string, unknown>): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: "agent_control", ...frame }));
+  }
+
   close() {
     if (!this.ws) return;
     this.ws.close(1000, "paperclip-complete");
@@ -800,6 +824,21 @@ class GatewayWsClient {
       void Promise.resolve(this.opts.onEvent(parsed)).catch(() => {
         // Ignore event callback failures and keep stream active.
       });
+      return;
+    }
+
+    // NOR-4837 Part 3 (AC10): inbound `agent_control` frames pushed by the
+    // gateway (e.g. `bundle_unavailable` when the gateway's bundle reload
+    // retries are exhausted). Forwarded to onAgentControl if registered;
+    // unhandled actions are silently ignored — the handler decides whether
+    // an unknown action is WARN-worthy. Persistence is offloaded behind a
+    // promise to keep the WS read loop non-blocking per spec.
+    if (isAgentControlFrame(parsed)) {
+      if (this.opts.onAgentControl) {
+        void Promise.resolve(this.opts.onAgentControl(parsed)).catch(() => {
+          // Ignore agent_control callback failures and keep stream active.
+        });
+      }
       return;
     }
 
@@ -1132,11 +1171,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
   const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
 
+  // NOR-4837 AC1-AC4: Forward the agent's current managed-bundle revision id
+  // on every dispatch so the gateway can detect a stale bundle and reload
+  // before executing the job. Null when the agent has no managed bundle (AC3).
+  const bundleRevisionId =
+    typeof ctx.agent.bundleRevisionId === "string" && ctx.agent.bundleRevisionId.length > 0
+      ? ctx.agent.bundleRevisionId
+      : null;
+
   const agentParams: Record<string, unknown> = {
     ...payloadTemplate,
     message,
     sessionKey,
     idempotencyKey: ctx.runId,
+    bundleRevisionId,
   };
   delete agentParams.text;
   // agentParams.paperclip = paperclipPayload; // PATCHED: PR #626 fix
@@ -1241,12 +1289,78 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     };
 
+    // NOR-4837 Part 3 (AC10-14): handle inbound `agent_control` frames pushed
+    // by the gateway. Currently only `bundle_unavailable` is recognized;
+    // unknown actions are logged at WARN level (AC12 — no silent drops).
+    // Persistence is offloaded to ctx.recordBundleUnavailable() so the WS
+    // read loop is never blocked by DB writes (spec: "must not block the
+    // WebSocket read loop").
+    const onAgentControl = async (frame: GatewayAgentControlFrame): Promise<void> => {
+      const action = nonEmpty(frame.action);
+      if (action !== "bundle_unavailable") {
+        await ctx.onLog(
+          "stdout",
+          `[openclaw-gateway] ignoring unknown agent_control action=${action ?? "<missing>"}\n`,
+        );
+        return;
+      }
+
+      const agentId = nonEmpty(frame.agentId);
+      const attemptedRevisionId = nonEmpty(frame.attemptedRevisionId);
+      const jobId = nonEmpty(frame.jobId);
+      const ts = nonEmpty(frame.ts);
+      const lastRetryError = nonEmpty(frame.lastRetryError);
+
+      // Required: agentId + attemptedRevisionId + jobId + ts. Missing any of
+      // these is malformed per AC12 — log WARN with raw payload, do not call
+      // ctx.recordBundleUnavailable (cannot dedupe without the triple).
+      if (!agentId || !attemptedRevisionId || !jobId || !ts) {
+        await ctx.onLog(
+          "stderr",
+          `[openclaw-gateway] WARN malformed bundle_unavailable frame (missing required fields): ${stringifyForLog(redactForLog(frame), 4_000)}\n`,
+        );
+        return;
+      }
+
+      if (!ctx.recordBundleUnavailable) {
+        await ctx.onLog(
+          "stdout",
+          "[openclaw-gateway] received bundle_unavailable but no recordBundleUnavailable handler is registered\n",
+        );
+        return;
+      }
+
+      try {
+        await ctx.recordBundleUnavailable({
+          agentId,
+          attemptedRevisionId,
+          jobId,
+          ts,
+          lastRetryError,
+        });
+      } catch (err) {
+        await ctx.onLog(
+          "stderr",
+          `[openclaw-gateway] recordBundleUnavailable failed: ${err instanceof Error ? err.message : String(err)}\n`,
+        );
+      }
+    };
+
     const client = new GatewayWsClient({
       url: parsedUrl.toString(),
       headers,
       onEvent,
+      onAgentControl,
       onLog: ctx.onLog,
     });
+
+    // NOR-4837 Part 2 (AC5–9): forward bundle_invalidated events to the
+    // gateway for the lifetime of the WebSocket session. The subscription
+    // is registered AFTER `client.connect` succeeds (so AC7 — "only push if
+    // agent has an active gateway WebSocket connection" — is satisfied by
+    // the subscription window itself) and torn down in `finally` before
+    // `client.close()`.
+    let unsubscribeBundleInvalidated: (() => void) | null = null;
 
     try {
       deviceIdentity = disableDeviceAuth ? null : resolveDeviceIdentity(parseObject(ctx.config));
@@ -1313,6 +1427,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "stdout",
         `[openclaw-gateway] connected protocol=${asNumber(asRecord(hello)?.protocol, PROTOCOL_VERSION)}\n`,
       );
+
+      // NOR-4837 Part 2 (AC5–9): start forwarding bundle_invalidated events
+      // now that the WS is open. Frames are emitted by the server-side
+      // bundle watcher (debounced 500ms per AC9, AFTER the new revision is
+      // persisted per AC8) and forwarded as top-level `agent_control` frames
+      // per AC6.
+      if (ctx.subscribeBundleInvalidated) {
+        unsubscribeBundleInvalidated = ctx.subscribeBundleInvalidated(
+          ctx.agent.id,
+          (evt) => {
+            client.sendAgentControl({
+              action: "bundle_invalidated",
+              bundleRevisionId: evt.bundleRevisionId,
+              agentId: evt.agentId,
+              ts: evt.ts,
+            });
+          },
+        );
+      }
 
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
@@ -1494,6 +1627,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         resultJson: asRecord(latestResultPayload),
       };
     } finally {
+      if (unsubscribeBundleInvalidated) {
+        try {
+          unsubscribeBundleInvalidated();
+        } catch {
+          // best-effort cleanup; never block close on a stray listener error
+        }
+        unsubscribeBundleInvalidated = null;
+      }
       client.close();
     }
   }
