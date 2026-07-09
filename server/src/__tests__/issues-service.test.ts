@@ -21,7 +21,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
-import { issueService } from "../services/issues.ts";
+import { backfillBlockedWithoutBlockers, issueService } from "../services/issues.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -1134,6 +1134,277 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       id: parentId,
       assigneeAgentId,
       childIssueIds: [childA, childB],
+    });
+  });
+
+  async function seedCompanyWithAgent() {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    return { companyId, assigneeAgentId };
+  }
+
+  /**
+   * Seeds two blockers pointing at one `blocked` dependent, then drives each blocker to
+   * its target status. Returns the dependent id so the caller can assert its status.
+   */
+  async function seedDependentWithBlockers(options: {
+    blockerStatuses: [string, string];
+    assign: "agent" | "user" | "none";
+  }) {
+    const { companyId, assigneeAgentId } = await seedCompanyWithAgent();
+    const blockerA = randomUUID();
+    const blockerB = randomUUID();
+    const dependentId = randomUUID();
+
+    await db.insert(issues).values([
+      { id: blockerA, companyId, title: "Blocker A", status: "todo", priority: "medium" },
+      { id: blockerB, companyId, title: "Blocker B", status: "todo", priority: "medium" },
+      {
+        id: dependentId,
+        companyId,
+        title: "Dependent",
+        status: "blocked",
+        priority: "medium",
+        ...(options.assign === "agent" ? { assigneeAgentId } : {}),
+        ...(options.assign === "user" ? { assigneeUserId: "local-board" } : {}),
+      },
+    ]);
+
+    await svc.update(dependentId, { blockedByIssueIds: [blockerA, blockerB] });
+
+    // Drive B first so A is always the *last* blocker to go terminal.
+    await db.update(issues).set({ status: options.blockerStatuses[1] }).where(eq(issues.id, blockerB));
+    await db.update(issues).set({ status: options.blockerStatuses[0] }).where(eq(issues.id, blockerA));
+
+    return { companyId, assigneeAgentId, blockerA, blockerB, dependentId };
+  }
+
+  async function statusOf(issueId: string) {
+    const rows = await db.select({ status: issues.status }).from(issues).where(eq(issues.id, issueId));
+    return rows[0]?.status ?? null;
+  }
+
+  describe("reconcileBlockedDependents", () => {
+    it("moves the dependent to todo and wakes it when both blockers are done", async () => {
+      const { assigneeAgentId, blockerA, blockerB, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["done", "done"],
+        assign: "agent",
+      });
+
+      const wakeable = await svc.reconcileBlockedDependents(blockerA);
+
+      expect(await statusOf(dependentId)).toBe("todo");
+      expect(wakeable).toEqual([
+        {
+          id: dependentId,
+          assigneeAgentId,
+          blockerIssueIds: expect.arrayContaining([blockerA, blockerB]),
+        },
+      ]);
+    });
+
+    it("treats a cancelled blocker as resolved alongside a done blocker", async () => {
+      const { assigneeAgentId, blockerA, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["done", "cancelled"],
+        assign: "agent",
+      });
+
+      const wakeable = await svc.reconcileBlockedDependents(blockerA);
+
+      expect(await statusOf(dependentId)).toBe("todo");
+      expect(wakeable).toEqual([expect.objectContaining({ id: dependentId, assigneeAgentId })]);
+    });
+
+    it("resolves the dependent when every blocker is cancelled", async () => {
+      const { blockerA, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["cancelled", "cancelled"],
+        assign: "agent",
+      });
+
+      const wakeable = await svc.reconcileBlockedDependents(blockerA);
+
+      expect(await statusOf(dependentId)).toBe("todo");
+      expect(wakeable).toHaveLength(1);
+    });
+
+    it("sinks an unassigned dependent to backlog without emitting a wake", async () => {
+      const { blockerA, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["done", "done"],
+        assign: "none",
+      });
+
+      const wakeable = await svc.reconcileBlockedDependents(blockerA);
+
+      expect(await statusOf(dependentId)).toBe("backlog");
+      expect(wakeable).toEqual([]);
+    });
+
+    it("moves a user-assigned dependent to todo but emits no agent wake", async () => {
+      const { blockerA, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["done", "done"],
+        assign: "user",
+      });
+
+      const wakeable = await svc.reconcileBlockedDependents(blockerA);
+
+      expect(await statusOf(dependentId)).toBe("todo");
+      expect(wakeable).toEqual([]);
+    });
+
+    it("leaves the dependent blocked while any blocker is still unresolved", async () => {
+      const { blockerA, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["done", "in_progress"],
+        assign: "agent",
+      });
+
+      const wakeable = await svc.reconcileBlockedDependents(blockerA);
+
+      expect(await statusOf(dependentId)).toBe("blocked");
+      expect(wakeable).toEqual([]);
+    });
+
+    it("is idempotent under a replayed terminal transition", async () => {
+      const { blockerA, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["done", "done"],
+        assign: "agent",
+      });
+
+      const first = await svc.reconcileBlockedDependents(blockerA);
+      const updatedAtAfterFirst = await db
+        .select({ updatedAt: issues.updatedAt })
+        .from(issues)
+        .where(eq(issues.id, dependentId))
+        .then((rows) => rows[0]!.updatedAt);
+
+      const second = await svc.reconcileBlockedDependents(blockerA);
+
+      expect(first).toHaveLength(1);
+      expect(second).toEqual([]);
+      expect(await statusOf(dependentId)).toBe("todo");
+      await expect(
+        db
+          .select({ updatedAt: issues.updatedAt })
+          .from(issues)
+          .where(eq(issues.id, dependentId))
+          .then((rows) => rows[0]!.updatedAt),
+      ).resolves.toEqual(updatedAtAfterFirst);
+    });
+
+    it("emits exactly one wake when two blockers complete concurrently", async () => {
+      const { blockerA, blockerB, dependentId } = await seedDependentWithBlockers({
+        blockerStatuses: ["done", "done"],
+        assign: "agent",
+      });
+
+      const [fromA, fromB] = await Promise.all([
+        svc.reconcileBlockedDependents(blockerA),
+        svc.reconcileBlockedDependents(blockerB),
+      ]);
+
+      expect(await statusOf(dependentId)).toBe("todo");
+      expect(fromA.length + fromB.length).toBe(1);
+    });
+  });
+
+  describe("backfillBlockedWithoutBlockers", () => {
+    async function insertBlocked(companyId: string, overrides: Record<string, unknown> = {}) {
+      const id = randomUUID();
+      await db.insert(issues).values({
+        id,
+        companyId,
+        title: "Stranded",
+        status: "blocked",
+        priority: "medium",
+        ...overrides,
+      });
+      return id;
+    }
+
+    async function insertBlocker(companyId: string, status: string) {
+      const id = randomUUID();
+      await db.insert(issues).values({ id, companyId, title: "Blocker", status, priority: "medium" });
+      return id;
+    }
+
+    async function link(companyId: string, blockerId: string, dependentId: string) {
+      await db
+        .insert(issueRelations)
+        .values({ companyId, issueId: blockerId, relatedIssueId: dependentId, type: "blocks" });
+    }
+
+    async function seedCompany() {
+      const companyId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      return companyId;
+    }
+
+    it("leaves issues that still have an unresolved blocker", async () => {
+      const companyId = await seedCompany();
+      const dependentId = await insertBlocked(companyId);
+      const blockerId = await insertBlocker(companyId, "in_progress");
+      await link(companyId, blockerId, dependentId);
+
+      await expect(backfillBlockedWithoutBlockers(db, { apply: true })).resolves.toEqual([]);
+      expect(await statusOf(dependentId)).toBe("blocked");
+    });
+
+    it("reports without writing during a dry run", async () => {
+      const companyId = await seedCompany();
+      const dependentId = await insertBlocked(companyId, { assigneeUserId: "local-board" });
+      const blockerId = await insertBlocker(companyId, "cancelled");
+      await link(companyId, blockerId, dependentId);
+
+      const plan = await backfillBlockedWithoutBlockers(db, { apply: false });
+
+      expect(plan).toEqual([expect.objectContaining({ id: dependentId, nextStatus: "todo" })]);
+      expect(await statusOf(dependentId)).toBe("blocked");
+    });
+
+    it("frees issues whose blockers are all terminal, sinking unassigned ones to backlog", async () => {
+      const companyId = await seedCompany();
+      const assignedId = await insertBlocked(companyId, { assigneeUserId: "local-board" });
+      const unassignedId = await insertBlocked(companyId);
+      const doneBlocker = await insertBlocker(companyId, "done");
+      const cancelledBlocker = await insertBlocker(companyId, "cancelled");
+      await link(companyId, doneBlocker, assignedId);
+      await link(companyId, cancelledBlocker, assignedId);
+      await link(companyId, doneBlocker, unassignedId);
+
+      await backfillBlockedWithoutBlockers(db, { apply: true });
+
+      expect(await statusOf(assignedId)).toBe("todo");
+      expect(await statusOf(unassignedId)).toBe("backlog");
+    });
+
+    it("frees an issue that has no blocker relations at all", async () => {
+      const companyId = await seedCompany();
+      const orphanId = await insertBlocked(companyId, { assigneeUserId: "local-board" });
+
+      await backfillBlockedWithoutBlockers(db, { apply: true });
+
+      expect(await statusOf(orphanId)).toBe("todo");
     });
   });
 });

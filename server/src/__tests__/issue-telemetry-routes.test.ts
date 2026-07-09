@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
-  listWakeableBlockedDependents: vi.fn(),
+  reconcileBlockedDependents: vi.fn(),
   update: vi.fn(),
 }));
 
@@ -89,7 +89,7 @@ describe("issue telemetry routes", () => {
     mockGetTelemetryClient.mockReturnValue({ track: vi.fn() });
     mockIssueService.getById.mockResolvedValue(makeIssue("todo"));
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
-    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.reconcileBlockedDependents.mockResolvedValue([]);
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...makeIssue("todo"),
       ...patch,

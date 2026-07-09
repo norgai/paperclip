@@ -1680,6 +1680,13 @@ export function issueRoutes(
       requestedByActorId: actor.actorId,
     });
 
+    const becameTerminal =
+      !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
+
+    // Cancelling a blocker resolves it just as completing it does. Reconcile before
+    // responding: the dependent's status write is durable, the wake below is not.
+    const resolvedDependents = becameTerminal ? await svc.reconcileBlockedDependents(issue.id) : [];
+
     // Merge all wakeups from this update into one enqueue per agent to avoid duplicate runs.
     void (async () => {
       type WakeupRequest = NonNullable<Parameters<typeof heartbeat.wakeup>[1]>;
@@ -1803,35 +1810,29 @@ export function issueRoutes(
         }
       }
 
-      const becameDone = existing.status !== "done" && issue.status === "done";
-      if (becameDone) {
-        const dependents = await svc.listWakeableBlockedDependents(issue.id);
-        for (const dependent of dependents) {
-          addWakeup(dependent.assigneeAgentId, {
-            source: "automation",
-            triggerDetail: "system",
-            reason: "issue_blockers_resolved",
-            payload: {
-              issueId: dependent.id,
-              resolvedBlockerIssueId: issue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
-            requestedByActorType: actor.actorType,
-            requestedByActorId: actor.actorId,
-            contextSnapshot: {
-              issueId: dependent.id,
-              taskId: dependent.id,
-              wakeReason: "issue_blockers_resolved",
-              source: "issue.blockers_resolved",
-              resolvedBlockerIssueId: issue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-            },
-          });
-        }
+      for (const dependent of resolvedDependents) {
+        addWakeup(dependent.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_blockers_resolved",
+          payload: {
+            issueId: dependent.id,
+            resolvedBlockerIssueId: issue.id,
+            blockerIssueIds: dependent.blockerIssueIds,
+          },
+          requestedByActorType: actor.actorType,
+          requestedByActorId: actor.actorId,
+          contextSnapshot: {
+            issueId: dependent.id,
+            taskId: dependent.id,
+            wakeReason: "issue_blockers_resolved",
+            source: "issue.blockers_resolved",
+            resolvedBlockerIssueId: issue.id,
+            blockerIssueIds: dependent.blockerIssueIds,
+          },
+        });
       }
 
-      const becameTerminal =
-        !["done", "cancelled"].includes(existing.status) && ["done", "cancelled"].includes(issue.status);
       if (becameTerminal && issue.parentId) {
         const parent = await svc.getWakeableParentAfterChildCompletion(issue.parentId);
         if (parent) {

@@ -37,6 +37,7 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getDefaultCompanyGoal } from "./goals.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 
 function assertTransition(from: string, to: string) {
@@ -534,6 +535,100 @@ function withActiveRuns(
     ...row,
     activeRun: row.executionRunId ? (runMap.get(row.executionRunId) ?? null) : null,
   }));
+}
+
+export interface BlockedDependentRow {
+  id: string;
+  status: string;
+  assigneeAgentId: string | null;
+  assigneeUserId: string | null;
+  blockerIssueIds: string[];
+  allBlockersResolved: boolean;
+}
+
+/**
+ * A blocker only holds a dependent while it is non-terminal. `cancelled` resolves a
+ * blocker just as `done` does — treating it as unresolved strands the dependent in
+ * `blocked` forever, however many of its sibling blockers complete.
+ */
+export function isUnresolvedBlockerStatus(status: string): boolean {
+  return !TERMINAL_ISSUE_STATUSES.includes(status);
+}
+
+/**
+ * Every issue blocked by `blockerIssueId`, with whether all of its blockers are now
+ * resolved. No assignee filter: the status invariant applies to unassigned dependents
+ * too, and they are precisely the population that gets stranded otherwise.
+ */
+async function listBlockedDependentRows(
+  dbOrTx: any,
+  blockerIssueId: string,
+): Promise<BlockedDependentRow[]> {
+  const blockerIssue = await dbOrTx
+    .select({ id: issues.id, companyId: issues.companyId })
+    .from(issues)
+    .where(eq(issues.id, blockerIssueId))
+    .then((rows: Array<{ id: string; companyId: string }>) => rows[0] ?? null);
+  if (!blockerIssue) return [];
+
+  const candidates: Array<{
+    id: string;
+    status: string;
+    assigneeAgentId: string | null;
+    assigneeUserId: string | null;
+  }> = await dbOrTx
+    .select({
+      id: issues.id,
+      status: issues.status,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+    })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.companyId, blockerIssue.companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.issueId, blockerIssueId),
+      ),
+    );
+  if (candidates.length === 0) return [];
+
+  const candidateIds = candidates.map((candidate) => candidate.id);
+  const blockerRows: Array<{ issueId: string; blockerIssueId: string; blockerStatus: string }> =
+    await dbOrTx
+      .select({
+        issueId: issueRelations.relatedIssueId,
+        blockerIssueId: issueRelations.issueId,
+        blockerStatus: issues.status,
+      })
+      .from(issueRelations)
+      .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .where(
+        and(
+          eq(issueRelations.companyId, blockerIssue.companyId),
+          eq(issueRelations.type, "blocks"),
+          inArray(issueRelations.relatedIssueId, candidateIds),
+        ),
+      );
+
+  const blockersByIssueId = new Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>();
+  for (const row of blockerRows) {
+    const list = blockersByIssueId.get(row.issueId) ?? [];
+    list.push({ blockerIssueId: row.blockerIssueId, blockerStatus: row.blockerStatus });
+    blockersByIssueId.set(row.issueId, list);
+  }
+
+  return candidates
+    .filter((candidate) => !["backlog", "done", "cancelled"].includes(candidate.status))
+    .map((candidate) => {
+      const blockers = blockersByIssueId.get(candidate.id) ?? [];
+      return {
+        ...candidate,
+        blockerIssueIds: blockers.map((blocker) => blocker.blockerIssueId),
+        allBlockersResolved: blockers.every((blocker) => !isUnresolvedBlockerStatus(blocker.blockerStatus)),
+      };
+    });
 }
 
 export function issueService(db: Db) {
@@ -1277,71 +1372,62 @@ export function issueService(db: Db) {
       return relations.get(issueId) ?? { blockedBy: [], blocks: [] };
     },
 
-    listWakeableBlockedDependents: async (blockerIssueId: string) => {
-      const blockerIssue = await db
-        .select({ id: issues.id, companyId: issues.companyId })
-        .from(issues)
-        .where(eq(issues.id, blockerIssueId))
-        .then((rows) => rows[0] ?? null);
-      if (!blockerIssue) return [];
+    listBlockedDependents: async (blockerIssueId: string, dbOrTx: any = db) => {
+      return listBlockedDependentRows(dbOrTx, blockerIssueId);
+    },
 
-      const candidates = await db
-        .select({
-          id: issues.id,
-          assigneeAgentId: issues.assigneeAgentId,
-          status: issues.status,
-        })
-        .from(issueRelations)
-        .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
-        .where(
-          and(
-            eq(issueRelations.companyId, blockerIssue.companyId),
-            eq(issueRelations.type, "blocks"),
-            eq(issueRelations.issueId, blockerIssueId),
-          ),
-        );
-      if (candidates.length === 0) return [];
+    listWakeableBlockedDependents: async (blockerIssueId: string, dbOrTx: any = db) => {
+      const dependents = await listBlockedDependentRows(dbOrTx, blockerIssueId);
+      return dependents
+        .filter((dependent) => dependent.assigneeAgentId && dependent.allBlockersResolved)
+        .map((dependent) => ({
+          id: dependent.id,
+          assigneeAgentId: dependent.assigneeAgentId!,
+          blockerIssueIds: dependent.blockerIssueIds,
+        }));
+    },
 
-      const candidateIds = candidates.map((candidate) => candidate.id);
-      const blockerRows = await db
-        .select({
-          issueId: issueRelations.relatedIssueId,
-          blockerIssueId: issueRelations.issueId,
-          blockerStatus: issues.status,
-        })
-        .from(issueRelations)
-        .innerJoin(issues, eq(issueRelations.issueId, issues.id))
-        .where(
-          and(
-            eq(issueRelations.companyId, blockerIssue.companyId),
-            eq(issueRelations.type, "blocks"),
-            inArray(issueRelations.relatedIssueId, candidateIds),
-          ),
-        );
+    /**
+     * Restores the `blocked` ∧ no-unresolved-blocker invariant after `blockerIssueId`
+     * goes terminal, and returns the dependents that should receive an
+     * `issue_blockers_resolved` wake.
+     *
+     * The status write is the durable part; the wake is an at-most-once side effect.
+     * Each write is guarded on `status = 'blocked'` so concurrent blocker completions
+     * cannot double-write, and a replayed transition is a no-op rather than churn.
+     * Unassigned dependents sink to `backlog` — writing `todo` would manufacture an
+     * issue no one can pick up.
+     */
+    reconcileBlockedDependents: async (blockerIssueId: string, dbOrTx: any = db) => {
+      const dependents = await listBlockedDependentRows(dbOrTx, blockerIssueId);
+      const wakeable: Array<{ id: string; assigneeAgentId: string; blockerIssueIds: string[] }> = [];
 
-      const blockersByIssueId = new Map<string, Array<{ blockerIssueId: string; blockerStatus: string }>>();
-      for (const row of blockerRows) {
-        const list = blockersByIssueId.get(row.issueId) ?? [];
-        list.push({ blockerIssueId: row.blockerIssueId, blockerStatus: row.blockerStatus });
-        blockersByIssueId.set(row.issueId, list);
+      for (const dependent of dependents) {
+        if (!dependent.allBlockersResolved || dependent.status !== "blocked") continue;
+
+        // A user-assigned dependent stays reachable by a human, so it earns `todo`;
+        // only a wholly unassigned one sinks to `backlog`.
+        const hasAssignee = Boolean(dependent.assigneeAgentId || dependent.assigneeUserId);
+        const reconciled = await dbOrTx
+          .update(issues)
+          .set({ status: hasAssignee ? "todo" : "backlog", updatedAt: new Date() })
+          .where(and(eq(issues.id, dependent.id), eq(issues.status, "blocked")))
+          .returning({ id: issues.id });
+
+        // Lost the race to a concurrent blocker completion, or this is a replayed
+        // transition. Either way the invariant already holds and the wake already fired.
+        if (reconciled.length === 0) continue;
+
+        if (dependent.assigneeAgentId) {
+          wakeable.push({
+            id: dependent.id,
+            assigneeAgentId: dependent.assigneeAgentId,
+            blockerIssueIds: dependent.blockerIssueIds,
+          });
+        }
       }
 
-      return candidates
-        .filter((candidate) => candidate.assigneeAgentId && !["backlog", "done", "cancelled"].includes(candidate.status))
-        .map((candidate) => {
-          const blockers = blockersByIssueId.get(candidate.id) ?? [];
-          return {
-            ...candidate,
-            blockerIssueIds: blockers.map((blocker) => blocker.blockerIssueId),
-            allBlockersDone: blockers.length > 0 && blockers.every((blocker) => blocker.blockerStatus === "done"),
-          };
-        })
-        .filter((candidate) => candidate.allBlockersDone)
-        .map((candidate) => ({
-          id: candidate.id,
-          assigneeAgentId: candidate.assigneeAgentId!,
-          blockerIssueIds: candidate.blockerIssueIds,
-        }));
+      return wakeable;
     },
 
     getWakeableParentAfterChildCompletion: async (parentIssueId: string) => {
@@ -2494,4 +2580,74 @@ export function issueService(db: Db) {
       }));
     },
   };
+}
+
+export interface BlockedInvariantBackfillEntry {
+  id: string;
+  identifier: string | null;
+  nextStatus: "todo" | "backlog";
+}
+
+/**
+ * One-shot sweep restoring the `blocked` ∧ no-unresolved-blocker invariant across every
+ * company. `reconcileBlockedDependents` holds the invariant going forward; this catches
+ * issues stranded before it landed, including ones whose blocker relations were deleted
+ * outright — a case the runtime path never observes.
+ *
+ * Writes are guarded on `status = 'blocked'` so a concurrent runtime reconciliation wins
+ * rather than being clobbered. Returns the plan; pass `apply: false` for a dry run.
+ */
+export async function backfillBlockedWithoutBlockers(
+  db: Db,
+  options: { apply: boolean },
+): Promise<BlockedInvariantBackfillEntry[]> {
+  const blockedIssues = await db
+    .select({
+      id: issues.id,
+      identifier: issues.identifier,
+      assigneeAgentId: issues.assigneeAgentId,
+      assigneeUserId: issues.assigneeUserId,
+    })
+    .from(issues)
+    .where(eq(issues.status, "blocked"));
+  if (blockedIssues.length === 0) return [];
+
+  const blockerRows = await db
+    .select({
+      issueId: issueRelations.relatedIssueId,
+      blockerStatus: issues.status,
+    })
+    .from(issueRelations)
+    .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+    .where(
+      and(
+        eq(issueRelations.type, "blocks"),
+        inArray(
+          issueRelations.relatedIssueId,
+          blockedIssues.map((issue) => issue.id),
+        ),
+      ),
+    );
+
+  const hasUnresolvedBlocker = new Set(
+    blockerRows.filter((row) => isUnresolvedBlockerStatus(row.blockerStatus)).map((row) => row.issueId),
+  );
+
+  const plan: BlockedInvariantBackfillEntry[] = blockedIssues
+    .filter((issue) => !hasUnresolvedBlocker.has(issue.id))
+    .map((issue) => ({
+      id: issue.id,
+      identifier: issue.identifier,
+      nextStatus: issue.assigneeAgentId || issue.assigneeUserId ? ("todo" as const) : ("backlog" as const),
+    }));
+
+  if (!options.apply) return plan;
+
+  for (const entry of plan) {
+    await db
+      .update(issues)
+      .set({ status: entry.nextStatus, updatedAt: new Date() })
+      .where(and(eq(issues.id, entry.id), eq(issues.status, "blocked")));
+  }
+  return plan;
 }

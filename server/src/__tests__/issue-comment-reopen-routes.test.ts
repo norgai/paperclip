@@ -8,7 +8,7 @@ const mockIssueService = vi.hoisted(() => ({
   update: vi.fn(),
   addComment: vi.fn(),
   findMentionedAgents: vi.fn(),
-  listWakeableBlockedDependents: vi.fn(),
+  reconcileBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
 }));
 
@@ -140,7 +140,7 @@ describe("issue comment reopen routes", () => {
     mockIssueService.update.mockReset();
     mockIssueService.addComment.mockReset();
     mockIssueService.findMentionedAgents.mockReset();
-    mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.reconcileBlockedDependents.mockReset();
     mockIssueService.getWakeableParentAfterChildCompletion.mockReset();
     mockAccessService.canUser.mockReset();
     mockAccessService.hasPermission.mockReset();
@@ -174,7 +174,7 @@ describe("issue comment reopen routes", () => {
       authorUserId: "local-board",
     });
     mockIssueService.findMentionedAgents.mockResolvedValue([]);
-    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.reconcileBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
     mockAccessService.canUser.mockResolvedValue(false);

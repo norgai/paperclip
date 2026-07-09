@@ -12,7 +12,7 @@ const mockIssueService = vi.hoisted(() => ({
   getCommentCursor: vi.fn(),
   getRelationSummaries: vi.fn(),
   update: vi.fn(),
-  listWakeableBlockedDependents: vi.fn(),
+  reconcileBlockedDependents: vi.fn(),
   getWakeableParentAfterChildCompletion: vi.fn(),
   findMentionedAgents: vi.fn(async () => []),
 }));
@@ -90,7 +90,7 @@ describe("issue dependency wakeups in issue routes", () => {
       latestCommentAt: null,
     });
     mockIssueService.getRelationSummaries.mockResolvedValue({ blockedBy: [], blocks: [] });
-    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
+    mockIssueService.reconcileBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
   });
 
@@ -129,7 +129,7 @@ describe("issue dependency wakeups in issue routes", () => {
       labels: [],
       labelIds: [],
     });
-    mockIssueService.listWakeableBlockedDependents.mockResolvedValue([
+    mockIssueService.reconcileBlockedDependents.mockResolvedValue([
       {
         id: "issue-2",
         assigneeAgentId: "agent-2",
@@ -208,5 +208,76 @@ describe("issue dependency wakeups in issue routes", () => {
         }),
       }),
     );
+  });
+
+  it("wakes dependents when the final blocker is cancelled rather than completed", async () => {
+    const base = {
+      id: "issue-1",
+      companyId: "company-1",
+      identifier: "PAP-100",
+      title: "Abandoned blocker",
+      description: null,
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue({ ...base, status: "in_progress" });
+    mockIssueService.update.mockResolvedValue({ ...base, status: "cancelled" });
+    mockIssueService.reconcileBlockedDependents.mockResolvedValue([
+      {
+        id: "issue-2",
+        assigneeAgentId: "agent-2",
+        blockerIssueIds: ["issue-1"],
+      },
+    ]);
+
+    const res = await request(createApp()).patch("/api/issues/issue-1").send({ status: "cancelled" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.reconcileBlockedDependents).toHaveBeenCalledWith("issue-1");
+    expect(mockWakeup).toHaveBeenCalledWith(
+      "agent-2",
+      expect.objectContaining({
+        reason: "issue_blockers_resolved",
+        payload: expect.objectContaining({
+          issueId: "issue-2",
+          resolvedBlockerIssueId: "issue-1",
+        }),
+      }),
+    );
+  });
+
+  it("does not reconcile dependents when the blocker stays non-terminal", async () => {
+    const base = {
+      id: "issue-1",
+      companyId: "company-1",
+      identifier: "PAP-100",
+      title: "Still going",
+      description: null,
+      priority: "medium",
+      parentId: null,
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      createdByAgentId: null,
+      createdByUserId: null,
+      executionWorkspaceId: null,
+      labels: [],
+      labelIds: [],
+    };
+    mockIssueService.getById.mockResolvedValue({ ...base, status: "todo" });
+    mockIssueService.update.mockResolvedValue({ ...base, status: "in_progress" });
+
+    const res = await request(createApp()).patch("/api/issues/issue-1").send({ status: "in_progress" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.reconcileBlockedDependents).not.toHaveBeenCalled();
   });
 });
