@@ -37,7 +37,14 @@ import { resolveIssueGoalId, resolveNextIssueGoalId } from "./issue-goal-fallbac
 import { getDefaultCompanyGoal } from "./goals.js";
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
+const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
+
+/** A blocker is unresolved when it has not reached a terminal status (done or cancelled). */
+export function isUnresolvedBlockerStatus(status: string): boolean {
+  return !TERMINAL_ISSUE_STATUSES.includes(status);
+}
+
 
 function assertTransition(from: string, to: string) {
   if (from === to) return;
@@ -1264,6 +1271,14 @@ export function issueService(db: Db) {
 
     getByIdentifier: async (identifier: string) => {
       return getIssueByIdentifier(identifier);
+    },
+
+    getStatusesByIds: async (ids: string[]): Promise<Array<{ id: string; status: string }>> => {
+      if (ids.length === 0) return [];
+      return db
+        .select({ id: issues.id, status: issues.status })
+        .from(issues)
+        .where(inArray(issues.id, ids));
     },
 
     getRelationSummaries: async (issueId: string) => {

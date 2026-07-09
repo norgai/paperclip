@@ -61,6 +61,7 @@ import {
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
+import { isUnresolvedBlockerStatus } from "../services/issues.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
 const updateIssueRouteSchema = updateIssueSchema.extend({
@@ -1264,6 +1265,27 @@ export function issueRoutes(
       await assertCanAssignTasks(req, companyId);
     }
 
+    // Guard: blocked status requires at least one unresolved blocker.
+    if (req.body.status === "blocked") {
+      const proposedBlockerIds: string[] = Array.isArray(req.body.blockedByIssueIds)
+        ? (req.body.blockedByIssueIds as string[])
+        : [];
+      if (proposedBlockerIds.length === 0) {
+        res.status(400).json({
+          error: "Cannot create issue with status blocked: provide at least one active blocker in blockedByIssueIds.",
+        });
+        return;
+      }
+      const blockerStatuses = await svc.getStatusesByIds(proposedBlockerIds);
+      const hasUnresolved = blockerStatuses.some((b) => isUnresolvedBlockerStatus(b.status));
+      if (!hasUnresolved) {
+        res.status(400).json({
+          error: "Cannot create issue with status blocked: all specified blockers are resolved (done or cancelled).",
+        });
+        return;
+      }
+    }
+
     const actor = getActorInfo(req);
     const executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
     const issue = await svc.create(companyId, {
@@ -1426,6 +1448,35 @@ export function issueRoutes(
     if (assigneeWillChange && !transition.workflowControlledAssignment) {
       if (!isAgentReturningIssueToCreator) {
         await assertCanAssignTasks(req, existing.companyId);
+      }
+    }
+
+    // Guard: status=blocked requires at least one unresolved blocker in the post-write edge set.
+    // Only fires when this request explicitly sets status to blocked — patching other fields on
+    // an already-blocked issue does not re-trigger the guard.
+    if (req.body.status === "blocked") {
+      let postWriteBlockerIds: string[];
+      if (Array.isArray(req.body.blockedByIssueIds)) {
+        // This request replaces the blocker edge set; use the proposed IDs.
+        postWriteBlockerIds = req.body.blockedByIssueIds as string[];
+      } else {
+        // blockedByIssueIds not in the request — existing edges are unchanged.
+        const relations = existingRelations ?? (await svc.getRelationSummaries(existing.id));
+        postWriteBlockerIds = (relations.blockedBy ?? []).map((r: { id: string }) => r.id);
+      }
+      if (postWriteBlockerIds.length === 0) {
+        res.status(400).json({
+          error: "Cannot set status to blocked: the issue has no unresolved blockers. Add at least one active blocker before setting this status.",
+        });
+        return;
+      }
+      const blockerStatuses = await svc.getStatusesByIds(postWriteBlockerIds);
+      const hasUnresolved = blockerStatuses.some((b) => isUnresolvedBlockerStatus(b.status));
+      if (!hasUnresolved) {
+        res.status(400).json({
+          error: "Cannot set status to blocked: all blockers are resolved (done or cancelled). Resolve the status or add an active blocker.",
+        });
+        return;
       }
     }
 
