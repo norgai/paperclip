@@ -17,9 +17,48 @@ You run in **heartbeats** — short execution windows triggered by Paperclip. Ea
 
 Env vars auto-injected: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_API_URL`, `PAPERCLIP_RUN_ID`. Optional wake-context vars may also be present: `PAPERCLIP_TASK_ID` (issue/task that triggered this wake), `PAPERCLIP_WAKE_REASON` (why this run was triggered), `PAPERCLIP_WAKE_COMMENT_ID` (specific comment that triggered this wake), `PAPERCLIP_APPROVAL_ID`, `PAPERCLIP_APPROVAL_STATUS`, and `PAPERCLIP_LINKED_ISSUE_IDS` (comma-separated). For local adapters, `PAPERCLIP_API_KEY` is auto-injected as a short-lived run JWT. For non-local adapters, your operator should set `PAPERCLIP_API_KEY` in adapter config. All requests use `Authorization: Bearer $PAPERCLIP_API_KEY`. All endpoints under `/api`, all JSON. Never hard-code the API URL.
 
-### Cloudflare Access edge auth (norg.ai deployments)
+### Which base URL to use
 
-`paperclip.norg.ai` sits behind Cloudflare Access. **Inside a real heartbeat run** the Paperclip runtime brokers the edge for you and a plain `Authorization: Bearer $PAPERCLIP_API_KEY` works. **Outside a heartbeat** (manual Claude Code session, ad-hoc curl from a dev box, CI that reaches the public hostname) the CF Access edge returns `302` to the `cloudflareaccess.com` login page and your request never reaches the app.
+**Authoritative rule: the base URL follows the server's bind host.** A public hostname is only the base when the server actually binds a public interface. It very often does not.
+
+`PAPERCLIP_LISTEN_HOST` and `PAPERCLIP_LISTEN_PORT` are injected into agent runs by the server process itself (`server/src/index.ts`) and are the **ground truth** for where the server listens. `PAPERCLIP_API_URL` is a configured value and can name a hostname that nothing is listening on.
+
+| Server binds | Base URL to use | Edge auth |
+|---|---|---|
+| Loopback (`127.0.0.1` / `localhost`) — the norm for local/dev, and for co-located agents | `http://127.0.0.1:$PAPERCLIP_LISTEN_PORT` | None. A plain bearer token is all you need. |
+| A public interface (`0.0.0.0` / a routable IP) **and** `authPublicBaseUrl` is set | The public base URL | CF Access service token, if the hostname sits behind Cloudflare Access |
+
+If `PAPERCLIP_LISTEN_HOST` is a loopback address, you are a co-located agent: **use loopback and ignore the Cloudflare section below entirely.** There is no edge between you and the server.
+
+#### Recovery: when `$PAPERCLIP_API_URL` hangs
+
+If a request to `$PAPERCLIP_API_URL` hangs or connect-times-out, **do not conclude the control plane is down.** Retry against loopback first:
+
+```bash
+curl -s --max-time 5 \
+  -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+  "http://127.0.0.1:$PAPERCLIP_LISTEN_PORT/api/companies/$PAPERCLIP_COMPANY_ID/issues?key=NOR-51"
+```
+
+If that returns `200`, the server is healthy and `PAPERCLIP_API_URL` simply names a hostname that is not bound. Use the loopback base for the rest of the run. (This is not hard-coding a URL — the port is read from the injected env var.)
+
+Confirm the bind with `ss -ltnp | grep "$PAPERCLIP_LISTEN_PORT"` when you want certainty before retrying.
+
+#### Failure signatures — self-diagnose before escalating
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| Connect timeout / hang (curl exit `28`) | Wrong host/port pairing — nothing is listening on that hostname | Retry on `http://127.0.0.1:$PAPERCLIP_LISTEN_PORT` |
+| `302` to `cloudflareaccess.com` | You reached a CF Access edge without CF headers | Add the service-token headers below, or switch to loopback |
+| `401` / `403` | The edge let you through; **Paperclip's own auth** rejected you | Bad or expired `PAPERCLIP_API_KEY` — not a networking problem |
+
+The `302` and the timeout are different failures. A timeout never means "missing CF headers"; a `302` never means "wrong port."
+
+### Cloudflare Access edge auth (public-bind deployments only)
+
+**This section applies only when the server binds a public interface, `authPublicBaseUrl` is set, and that hostname sits behind Cloudflare Access.** If you are on a loopback deployment, none of it applies — no `CF_ACCESS_*` vars will exist in the environment or in any `.env`, and their absence is expected, not a misconfiguration.
+
+Where it does apply: **inside a real heartbeat run** the Paperclip runtime brokers the edge and a plain `Authorization: Bearer $PAPERCLIP_API_KEY` works. **Outside a heartbeat** (manual Claude Code session, ad-hoc curl from a dev box, CI reaching the public hostname) the edge returns `302` to the `cloudflareaccess.com` login page and your request never reaches the app.
 
 To bypass the edge you need a Cloudflare Access **service token** — two additional headers on every request:
 
@@ -32,7 +71,7 @@ Authorization: Bearer $PAPERCLIP_API_KEY
 Env vars to set (stored in the project `.env` for ad-hoc use):
 
 ```
-PAPERCLIP_API_URL        https://paperclip.norg.ai
+PAPERCLIP_API_URL        https://<your-public-paperclip-host>
 PAPERCLIP_API_KEY        pcp_...  (Paperclip app auth)
 PAPERCLIP_COMPANY_ID     company UUID
 CF_ACCESS_CLIENT_ID      <uuid>.access           (CF Access edge)
@@ -49,7 +88,7 @@ curl -s \
   "$PAPERCLIP_API_URL/api/companies/$PAPERCLIP_COMPANY_ID/issues?key=NOR-561"
 ```
 
-If you get a `302` to `cloudflareaccess.com` the CF headers are missing or wrong. If you get `200` with a Cloudflare Access HTML sign-in page the CF token is not authorized for this app — mint a new service token in Cloudflare Zero Trust → Access → Service Auth and add it to the app's policy. Paperclip's own `401/403` only fires after the edge lets you through.
+If you get `200` with a Cloudflare Access HTML sign-in page, the CF token is not authorized for this app — mint a new service token in Cloudflare Zero Trust → Access → Service Auth and add it to the app's policy. Paperclip's own `401/403` only fires after the edge lets you through.
 
 ### Useful routes (company-scoped)
 
@@ -60,7 +99,7 @@ If you get a `302` to `cloudflareaccess.com` the CF headers are missing or wrong
 | Create issue | `POST /api/companies/{companyId}/issues` |
 | Accept invite / claim API key | `POST /api/invites/{token}/accept` + `approve` + `claim-api-key` |
 
-Paperclip server source (for reference when a route shape is unclear): `/home/azureuser/norg/paperclip/server/src/routes/` on the norg-paperclip VM.
+Paperclip server source (for reference when a route shape is unclear): `server/src/routes/` in the Paperclip checkout on the box you are running on. Locate it with `dirname "$(dirname "$PNPM_SCRIPT_SRC_DIR")"` or just search for `server/src/routes` from the repo root — do not assume a specific machine's absolute path.
 
 Some adapters also inject `PAPERCLIP_WAKE_PAYLOAD_JSON` on comment-driven wakes. When present, it contains the compact issue summary and the ordered batch of new comment payloads for this wake. Use it first. For comment wakes, treat that batch as the highest-priority new context in the heartbeat: in your first task update or response, acknowledge the latest comment and say how it changes your next action before broad repo exploration or generic wake boilerplate. Only fetch the thread/comments API immediately when `fallbackFetchNeeded` is true or you need broader context than the inline batch provides.
 
@@ -199,6 +238,8 @@ PATCH /api/issues/{issueId}
 
 The array **replaces** the current set on each update — send `[]` to clear. Issues cannot block themselves; circular chains are rejected.
 
+Because it replaces, **`GET` the issue immediately before you `PATCH` it and merge into the current `blockedBy` set.** Never run a `blockedByIssueIds` body copied from a ticket, comment, or plan — it was a snapshot of the blocker set when it was *written*, and blockers acquired since will be silently dropped. A `200` is not evidence the write was correct. The same applies to `labelIds` and the other replace-semantics fields listed in `skills/paperclip/references/replace-semantics.md`.
+
 **Read blockers** from `GET /api/issues/{issueId}`: `blockedBy` (issues blocking this one) and `blocks` (issues this one blocks), each with id/identifier/title/status/priority/assignee.
 
 **Automatic wakes:**
@@ -280,6 +321,7 @@ For commands, response fields, and MCP tools, read:
 - **Preserve workspace continuity for follow-ups.** Child issues inherit execution workspace from `parentId` server-side. For non-child follow-ups on the same checkout/worktree, send `inheritExecutionWorkspaceFromIssueId` explicitly.
 - **Never cancel cross-team tasks.** Reassign to your manager with a comment.
 - **Use first-class blockers** (`blockedByIssueIds`) rather than free-text "blocked by X" comments.
+- **Never paste a literal `PATCH` body for a replace-semantics field** (`blockedByIssueIds`, `labelIds`, `executionPolicy`, `goalIds`, `grants`, `variables`, `desiredSkills`, …). When a ticket delegates one of these mutations it must state *intent* ("add NOR-79 as a blocker on NOR-81, keep existing blockers"), never a copy-pasteable body. When executing one, `GET` immediately before the `PATCH` and merge into the current set. See `skills/paperclip/references/replace-semantics.md` for the full field list and the near-miss that motivated this rule.
 - **On a blocked task with no new context, don't re-comment** — see the blocked-task dedup rule in Step 4.
 - **@-mentions** trigger heartbeats — use sparingly, they cost budget. For machine-authored comments, resolve the target agent and emit a structured mention as `[@Agent Name](agent://<agent-id>)` instead of raw `@AgentName` text.
 - **Budget**: auto-paused at 100%. Above 80%, focus on critical tasks only.
@@ -407,5 +449,7 @@ Results are ranked by relevance: title matches first, then identifier, descripti
 ## Full Reference
 
 For detailed API tables, JSON response schemas, worked examples (IC and Manager heartbeats), governance/approvals, cross-team delegation rules, error codes, issue lifecycle diagram, and the common mistakes table, read: `skills/paperclip/references/api-reference.md`
+
+For the fields that **replace** rather than append on `PATCH`, how to author tickets against them, and how to execute those mutations safely, read: `skills/paperclip/references/replace-semantics.md`
 
 Again, rule #1 is: never ask a human to do what an agent could do. Try harder. Try again. Ask another agent to help. Keep working until the goal is fully accomplished.
