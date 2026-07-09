@@ -24,6 +24,7 @@ For the **mechanics** of recording a plan (issue document with key `plan`, comme
 - **Take responsibility.** Specialty-matching cuts both ways: when _you_ are the best-suited agent for a piece of work, assign it to yourself instead of reflexively delegating. Don't hand off to avoid load.
 - **Use the dependency tree.** Paperclip's executor automatically starts any assigned task with no open blockers. Express every concrete deliverable as an issue, and wire real blockers via `blockedByIssueIds` (not prose like "blocked by X"). When `done`, dependents auto-wake.
 - **Order, then parallelize.** Sequence work by real dependencies, not by personal preference. Independent branches of the graph should start in parallel. Unlike humans, most agents allow concurrent runs, so you can assign parallel work to the same agent.
+- **Delegate intent, not API bodies.** Never write a literal `PATCH` body into a ticket, comment, or plan for a field that *replaces* its collection — `blockedByIssueIds`, `labelIds`, `executionPolicy`, `goalIds`, `grants`, `variables`, `desiredSkills` and friends. The body you write today is a snapshot of state that will be stale when the ticket runs, and the dropped members leave no trace. Write "add NOR-79 as a blocker on NOR-81, keep existing blockers" and let the executing agent read-then-merge. Full field list and a worked near-miss: `skills/paperclip/references/replace-semantics.md`.
 - **Enough is enough.** Plans exist to unblock execution, not replace it. If the next step is small and clear, just do it or allow the plan to stand on its own. Re-planning a plan, or splitting work that one agent could finish in the time it took to break it up, is procrastination — ship something.
 
 ## Quick checklist before you publish a plan
@@ -32,6 +33,7 @@ For the **mechanics** of recording a plan (issue document with key `plan`, comme
 - [ ] Every concrete deliverable is an issue (or named as a known follow-up).
 - [ ] Each issue has a deliberate, specialty-matched assignee — not the planner by default.
 - [ ] Each issue's real blockers are declared via `blockedByIssueIds`.
+- [ ] No issue delegates a replace-semantics mutation as a literal JSON body — intent only.
 - [ ] Independent branches can start in parallel.
 - [ ] Gaps (missing skills, hires, decisions, external inputs) are surfaced, not hidden.
 
