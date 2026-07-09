@@ -461,6 +461,22 @@ export function issueRoutes(
     });
   }
 
+  const ACTIVE_ISSUE_STATUSES = new Set(["todo", "in_progress", "in_review", "blocked"]);
+
+  function assertAssigneeRequiredForActiveStatus(
+    res: Response,
+    status: string,
+    assigneeAgentId: string | null | undefined,
+    assigneeUserId: string | null | undefined,
+  ): boolean {
+    if (!ACTIVE_ISSUE_STATUSES.has(status)) return true;
+    if (assigneeAgentId || assigneeUserId) return true;
+    res.status(400).json({
+      error: `Issues in status "${status}" must have an assignee. Set assigneeAgentId or assigneeUserId, or use status "backlog".`,
+    });
+    return false;
+  }
+
   async function normalizeIssueIdentifier(rawId: string): Promise<string> {
     if (/^[A-Z]+-\d+$/i.test(rawId)) {
       const issue = await svc.getByIdentifier(rawId);
@@ -1264,6 +1280,11 @@ export function issueRoutes(
       await assertCanAssignTasks(req, companyId);
     }
 
+    const effectiveStatus: string = req.body.status ?? "backlog";
+    if (!assertAssigneeRequiredForActiveStatus(res, effectiveStatus, req.body.assigneeAgentId, req.body.assigneeUserId)) {
+      return;
+    }
+
     const actor = getActorInfo(req);
     const executionPolicy = normalizeIssueExecutionPolicy(req.body.executionPolicy);
     const issue = await svc.create(companyId, {
@@ -1427,6 +1448,11 @@ export function issueRoutes(
       if (!isAgentReturningIssueToCreator) {
         await assertCanAssignTasks(req, existing.companyId);
       }
+    }
+
+    const nextStatus: string = (updateFields.status as string | undefined) ?? existing.status;
+    if (!assertAssigneeRequiredForActiveStatus(res, nextStatus, nextAssigneeAgentId, nextAssigneeUserId)) {
+      return;
     }
 
     let issue;
